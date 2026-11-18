@@ -1,0 +1,1127 @@
+//@version=6
+indicator("NF", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=600)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NF v1.1 — repaint & accuracy fixes for the Child Contribution engine
+//   FIX 2.1  HTF mode: tiers/markers are scored only on CONFIRMED bars and only for
+//            COMPLETE containers (every child bar present). No more live "ghost" Tier-3.
+//   FIX 2.2  LTF mode: removed the lookahead_on container-volume request. Contribution is
+//            built from a running child-volume sum and finalised at the container's close.
+//   FIX 2.3  Contribution = max child volume / SUM of that container's own child volumes
+//            (same feed top and bottom), instead of 1m volume / 5m volume.
+//   Every changed block is tagged "FIX 2.x". Nothing else in the script was changed.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- MASTER DISPLAY CONTROL (must be first) ---
+grpDisplay       = "Display"
+hiof_cleanChart  = input.bool(false, "🔲 Clean Chart (OB Zones + Signals Only)", group=grpDisplay, tooltip="Hides ALL other visual elements — HVMV, markers, regime shading, volume anomaly, VWAP, day levels, BOS labels, pivot markers, structural FVGs. Only confluence Order Block zones and buy/sell signals remain.")
+
+grpSignals       = "HIOF — Signals"
+hiof_showSignals = input.bool(true, "Show Buy/Sell Signals", group=grpSignals)
+hiof_sigBreakout = input.bool(true, "Signal on OB Formation (Breakout)", group=grpSignals, tooltip="Plot signal when a Golden Setup OB is confirmed via BOS + FVG + Volume confluence.")
+hiof_sigRetest   = input.bool(true, "Signal on OB Retest (Institutional Entry)", group=grpSignals, tooltip="Plot signal when price returns to test an active, unmitigated OB zone. This is the primary trade entry.")
+hiof_sigBuyColor = input.color(color.rgb(0, 230, 118), "Buy Signal Color", group=grpSignals)
+hiof_sigSellColor= input.color(color.rgb(255, 82, 82), "Sell Signal Color", group=grpSignals)
+
+// --- Effective show flags: suppressed when Clean Chart is on ---
+bool _clean = hiof_cleanChart
+
+//HVMV SETTINGS
+
+grpHVMV1 = "HVMV Settings"
+showHVMV      = input.bool(true, "Show HVMV Step Line", group=grpHVMV1)
+hvmvHTF       = input.timeframe("5", "HVMV Container Timeframe", group=grpHVMV1, tooltip="Higher timeframe container. HVMV finds the highest-volume child bar within each container period.")
+hvmvChildTF   = input.timeframe("1", "HVMV Child Timeframe", group=grpHVMV1, tooltip="Lower timeframe child. POC of the max-volume child bar within each container is plotted.")
+htfDaily      = input.timeframe("D", "HVMV Reset Timeframe", group=grpHVMV1)
+hvmvColor     = input.color(color.rgb(255, 255, 255), "HVMV Color", group=grpHVMV1)
+hvmvTrans     = input.int(30, "HVMV Transparency", minval=0, maxval=100, group=grpHVMV1)
+
+
+//==========================================================================================
+
+useSession = input.bool(true, "Filter to NSE 09:15-15:30")
+
+grpContainer = "Container Timeframe (For Child Contribution)"
+containerTF = input.timeframe("5", "Container Timeframe", group=grpContainer, tooltip="The timeframe that 'contains' child bars. Child contribution is ALWAYS calculated relative to this timeframe's bar volume, regardless of chart timeframe.")
+
+grpChild = "Child Timeframe Settings"
+ltfChild = input.timeframe("1", "Child Timeframe", group=grpChild, tooltip="Use 1S for true volume footprint from your data provider. Must be lower than Container Timeframe.")
+// FIX 2.1 / 2.3 — data-quality gate: skip containers with missing child bars
+requireComplete = input.bool(true, "Require Complete Containers", group=grpChild, tooltip="Score a container only when every child bar is present (e.g. all 5 one-minute bars of a 5m container). Containers with missing child bars are skipped instead of showing an inflated share. The session's last, shorter container (e.g. 15:15 on 30m/60m) is judged against the minutes it actually covers.")
+
+grpBaseline = "Adaptive Baseline"
+baselineLookback = input.int(1000, "Baseline Lookback (Container bars)", minval=20, maxval=2000, group=grpBaseline)
+volumeLookback = input.int(1000, "Volume Lookback (Container bars)", minval=50, maxval=2000, group=grpBaseline)
+
+grpStaticTiers = "Static Tier Thresholds (When Dynamic OFF)"
+staticT1Input = input.float(50.0, "Static Tier 1 Threshold %", minval=1, maxval=100, step=5, group=grpStaticTiers, tooltip="Minimum exceedance % for Tier 1 (circle plot)")
+staticT2Input = input.float(75.0, "Static Tier 2 Threshold %", minval=5, maxval=150, step=5, group=grpStaticTiers, tooltip="Minimum exceedance % for Tier 2 (marker + volume label)")
+staticT3Input = input.float(100.0, "Static Tier 3 Threshold %", minval=20, maxval=300, step=10, group=grpStaticTiers, tooltip="Minimum exceedance % for Tier 3 (extreme marker)")
+
+grpDynamicTiers = "Dynamic Tier Thresholds (Percentile-Based)"
+useDynamicTiers = input.bool(false, "Use Dynamic Tier Thresholds", group=grpDynamicTiers, tooltip="When enabled, tier color thresholds are calculated dynamically based on historical exceedance percentiles.")
+tier1Percentile = input.float(50.0, "Tier 1 Percentile (Common)", minval=10, maxval=200, step=5, group=grpDynamicTiers)
+tier2Percentile = input.float(80.0, "Tier 2 Percentile (Medium)", minval=40, maxval=200, step=5, group=grpDynamicTiers)
+tier3Percentile = input.float(99.0, "Tier 3 Percentile (Extreme/Rare)", minval=70, maxval=200, step=1, group=grpDynamicTiers)
+exceedanceLookback = input.int(500, "Exceedance History Lookback", minval=100, maxval=5000, group=grpDynamicTiers)
+minHistoryForDynamic = input.int(500, "Min History for Dynamic", minval=20, maxval=2000, group=grpDynamicTiers)
+
+grpVisual = "Visualization"
+showMarkers = input.bool(true, "Show Volume Contribution Markers", group=grpVisual)
+showVolValue = input.bool(true, "Show Volume Value Label", group=grpVisual)
+showExcPct   = input.bool(true, "Show Exceedance % Label", group=grpVisual)
+markerSizeInput = input.string("normal", "Marker Size", options=["tiny", "small", "normal", "large", "huge"], group=grpVisual)
+volumeLabelSizeInput = input.string("small", "Volume Label Size", options=["tiny", "small", "normal", "large", "huge"], group=grpVisual)
+minVolumePctOfAvg = input.float(10.0, "Min Volume % of Avg", minval=10, maxval=100, step=5, group=grpVisual)
+labelBodyFrac = input.float(0.5, "Label Gap (body fraction)", minval=0.1, maxval=3.0, step=0.1, group=grpVisual, tooltip="Primary gap: fraction of candle body height away from body edge.")
+labelMinGapPct = input.float(0.05, "Label Min Gap (% of price)", minval=0.005, maxval=0.5, step=0.005, group=grpVisual, tooltip="Floor for dojis and tiny bodies. Auto-scales across instruments.")
+labelMaxGapPct = input.float(0.5, "Label Max Gap (% of price)", minval=0.1, maxval=2.0, step=0.1, group=grpVisual, tooltip="Ceiling to prevent explosive candles from pushing labels too far.")
+bool showAnyVolLabel = showVolValue or showExcPct
+
+grpMarkerExceedance = "Volume Marker Exceedance Settings"
+markerExceedancePct = input.float(50.0, "Min Exceedance % for Volume Marker (Fallback)", minval=0, maxval=200, step=10, group=grpMarkerExceedance)
+markerExceedanceSizeInput = input.string("normal", "Volume Marker Size", options=["tiny", "small", "normal"], group=grpMarkerExceedance)
+
+grpColors = "Tier Colors (Baseline Exceedance)"
+colorTier1 = input.color(color.rgb(246, 247, 249), "Tier 1: Common", group=grpColors)
+colorTier2 = input.color(color.rgb(91, 252, 104), "Tier 2: Medium", group=grpColors)
+colorTier3 = input.color(color.rgb(139, 170, 255), "Tier 3: Extreme/Rare", group=grpColors)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HVMV SETTINGS — SIMPLIFIED: Max-Volume Child POC per Container
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+grpVWAP = "Session VWAP"
+showSessVWAP = input.bool(false, "Show Session VWAP", group=grpVWAP)
+sessVWAPColor = input.color(color.rgb(101, 94, 73), "Session VWAP Color", group=grpVWAP)
+sessVWAPTrans = input.int(20, "Session VWAP Transparency", minval=0, maxval=100, group=grpVWAP)
+
+grpDayWeek = "Previous Day Levels"
+showDayHL = input.bool(true, "Show Previous Day High/Low", group=grpDayWeek)
+dayHighColor = input.color(color.rgb(3, 121, 109, 50), "Day High Color", group=grpDayWeek)
+dayLowColor = input.color(color.rgb(156, 39, 31, 80), "Day Low Color", group=grpDayWeek)
+dayVWAPColor = input.color(color.rgb(89, 86, 35, 70), "Previous Day VWAP Color", group=grpDayWeek)
+dayWeekLineWidth = input.int(1, "Line Width", minval=1, maxval=4, group=grpDayWeek)
+dayWeekTrans = input.int(30, "Line Transparency", minval=0, maxval=80, group=grpDayWeek)
+
+grpRefTable = "Price Reference Table"
+showRefTable = input.bool(false, "Show Price Reference Table", group=grpRefTable)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIOF INPUTS — Hybrid Institutional Order Flow
+// ═══════════════════════════════════════════════════════════════════════════
+
+grpHiofStruct       = "HIOF — Market Structure"
+hiof_pivotLeft_5m    = input.int(6, "5m Pivot Left Bars", minval=1, maxval=20, group=grpHiofStruct, tooltip="Left lookback for chart-TF (5m) pivots. Higher = requires stronger preceding trend.")
+hiof_pivotRight_5m   = input.int(3, "5m Pivot Right Bars", minval=1, maxval=10, group=grpHiofStruct, tooltip="Right confirmation for chart-TF (5m) pivots. Lower = faster reversal detection.")
+hiof_pivotLeft_15m   = input.int(4, "15m Pivot Left Bars", minval=1, maxval=20, group=grpHiofStruct, tooltip="Left lookback for 15m pivots pulled via request.security.")
+hiof_pivotRight_15m  = input.int(2, "15m Pivot Right Bars", minval=1, maxval=10, group=grpHiofStruct, tooltip="Right confirmation for 15m pivots.")
+hiof_pivotVolFilter  = input.bool(true, "Volume-Validate Pivots", group=grpHiofStruct, tooltip="When enabled, a pivot is only accepted if the pivot bar's volume exceeds the minimum threshold below.")
+hiof_pivotVolPct     = input.float(50.0, "Pivot Min Volume (% of Vol EMA)", minval=10, maxval=200, step=10, group=grpHiofStruct, tooltip="Pivot bar volume must be >= this % of the HIOF Volume EMA. Filters out low-liquidity noise pivots.")
+hiof_showBOS         = input.bool(true, "Show BOS Labels", group=grpHiofStruct)
+hiof_showPivots      = input.bool(false, "Show 5m Pivot Markers", group=grpHiofStruct)
+hiof_show15mPivots   = input.bool(false, "Show 15m Pivot Markers", group=grpHiofStruct)
+hiof_bosLabelSize    = input.string("small", "BOS Label Size", options=["tiny","small","normal"], group=grpHiofStruct)
+
+grpHiofFVG          = "HIOF — Fair Value Gaps"
+hiof_showFVG         = input.bool(true, "Show FVGs", group=grpHiofFVG)
+hiof_showStdFVG      = input.bool(false, "Show All Structural FVGs", group=grpHiofFVG, tooltip="Shows every same-session FVG regardless of volume. Off = only volume-displaced FVGs visible.")
+hiof_fvgBullColor    = input.color(color.new(color.teal, 85), "Bullish FVG Color", group=grpHiofFVG)
+hiof_fvgBearColor    = input.color(color.new(color.maroon, 85), "Bearish FVG Color", group=grpHiofFVG)
+hiof_fvgMaxBars      = input.int(50, "FVG Max Extension (bars)", minval=10, maxval=200, group=grpHiofFVG)
+
+grpHiofOB           = "HIOF — Order Blocks (Golden Setup)"
+hiof_showOB          = input.bool(true, "Show Confluence Order Blocks", group=grpHiofOB)
+hiof_obVolMult       = input.float(1.5, "OB Volume Multiplier (vs EMA)", minval=1.0, maxval=5.0, step=0.1, group=grpHiofOB, tooltip="Displacement candle volume must exceed Volume EMA × this multiplier.")
+hiof_obVolEmaLen     = input.int(20, "Volume EMA Length", minval=5, maxval=100, group=grpHiofOB)
+hiof_obZoneMode      = input.string("Full Candle", "OB Zone Definition", options=["Full Candle","Body Only"], group=grpHiofOB, tooltip="Full Candle = High-to-Low. Body Only = Open-to-Low (bull) / Open-to-High (bear).")
+hiof_obBullColor     = input.color(color.new(#0097A7, 75), "Bullish OB Color", group=grpHiofOB)
+hiof_obBearColor     = input.color(color.new(#C62828, 75), "Bearish OB Color", group=grpHiofOB)
+hiof_obMitigatedColor= input.color(color.new(color.gray, 92), "Mitigated OB Color", group=grpHiofOB)
+hiof_obMaxActive     = input.int(50, "Max Active OB Zones", minval=10, maxval=100, group=grpHiofOB)
+hiof_showSweepTag    = input.bool(true, "Tag Liquidity Sweep OBs (PPDD)", group=grpHiofOB)
+hiof_sweepMarkerColor= input.color(color.rgb(255, 215, 0), "Sweep Marker Color", group=grpHiofOB)
+hiof_showMitigated   = input.bool(true, "Show Mitigated Zones (greyed out)", group=grpHiofOB)
+hiof_mitigationMethod= input.string("Wick", "Mitigation Method", options=["Wick","Close"], group=grpHiofOB, tooltip="Wick = any part of the candle touches the OB zone (default, more sensitive). Close = candle must close inside or through the zone (stricter, fewer false mitigations).")
+
+grpHiofVol          = "HIOF — Volume Normalization (NSE 9:15 Fix)"
+hiof_volCapMethod    = input.string("Cap", "Opening Bar Volume Handling", options=["Cap","Exclude","None"], group=grpHiofVol, tooltip="Cap = clamp 9:15 bar to Nth percentile of recent volume. Exclude = skip it from EMA seed. None = raw.")
+hiof_volCapPercentile= input.float(90.0, "Cap Percentile", minval=50, maxval=99, step=5, group=grpHiofVol)
+hiof_volCapLookback  = input.int(100, "Volume History Lookback", minval=20, maxval=500, group=grpHiofVol)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODE DETECTION — DUAL ARCHITECTURE
+// ═══════════════════════════════════════════════════════════════════════════
+int _chartSec  = timeframe.in_seconds()
+int _contSec   = timeframe.in_seconds(containerTF)
+int _hvmvCSec  = timeframe.in_seconds(hvmvHTF)
+int _hvmvChSec = timeframe.in_seconds(hvmvChildTF)
+
+bool isMarkerLTF     = _chartSec < _contSec
+bool isHvmvLTF       = _chartSec < _hvmvCSec
+bool hvmvChildIsChart = _chartSec == _hvmvChSec
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+var int SESS_START_MINS = 9 * 60 + 15
+var int SESS_END_MINS   = 15 * 60 + 30
+
+f_size(string s) => s == "tiny" ? size.tiny : s == "small" ? size.small : s == "large" ? size.large : s == "huge" ? size.huge : size.normal
+var volLabelSize = f_size(volumeLabelSizeInput)
+var markerExcSize = f_size(markerExceedanceSizeInput)
+
+f_inSess(int ts) => not useSession or (hour(ts) * 60 + minute(ts) >= SESS_START_MINS and hour(ts) * 60 + minute(ts) <= SESS_END_MINS)
+
+// FIX 2.1 / 2.3 — how many child bars a complete container should hold (session-aware)
+f_expChildren(int contStartT) =>
+    float childMin = timeframe.in_seconds(ltfChild) / 60.0
+    float contMinF = timeframe.in_seconds(containerTF) / 60.0
+    int   startM   = hour(contStartT) * 60 + minute(contStartT)
+    float spanMin  = useSession ? math.min(contMinF, SESS_END_MINS - startM) : contMinF
+    int(math.max(1, math.floor(spanMin / childMin)))
+
+f_poc(float o, float h, float l, float c) =>
+    float rng = h - l
+    if rng == 0.0
+        c
+    else
+        float br = math.abs(c - o) / rng
+        float poc = br >= 0.60 ? (c >= o ? (l + o) * 0.5 : (h + o) * 0.5) : br >= 0.30 ? (o + c) * 0.5 : (h + l) * 0.5
+        math.max(l, math.min(h, poc + 0.10 * ((math.min(o, c) - l) - (h - math.max(o, c)))))
+
+f_fmtVol(float v) => na(v) ? "" : v >= 1000000 ? str.tostring(math.ceil(v / 1000000)) + "M" : v >= 1000 ? str.tostring(math.ceil(v / 1000)) + "K" : str.tostring(math.ceil(v))
+
+f_pctRank(array<float> arr, float val) =>
+    int sz = array.size(arr)
+    if sz == 0 or na(val)
+        na
+    else
+        int cnt = 0
+        for i = 0 to sz - 1
+            if array.get(arr, i) < val
+                cnt += 1
+        float(cnt) / float(sz) * 100.0
+
+// --- Volume label builder: respects split checkboxes ---
+f_buildVolLabel(float vol, float contrib) =>
+    string _v = showVolValue  ? f_fmtVol(vol) : ""
+    string _p = showExcPct    ? str.tostring(math.round(contrib)) + "%" : ""
+    string _sep = showVolValue and showExcPct ? "\n" : ""
+    _v + _sep + _p
+
+// --- Body-aware label Y placement ---
+f_labelY(bool isBull, float hi, float lo, float o, float c) =>
+    float body     = math.abs(c - o)
+    float px       = math.max(math.abs(c), syminfo.mintick)
+    float _rng     = hi - lo
+    float bodyGap  = body * labelBodyFrac
+    float rangeGap = _rng * 0.15
+    float pctFloor = px * labelMinGapPct / 100.0
+    float hardMin  = syminfo.mintick * 5.0
+    float hardMax  = px * labelMaxGapPct / 100.0
+    float gap      = math.min(hardMax, math.max(hardMin, math.max(pctFloor, math.max(bodyGap, rangeGap))))
+    isBull ? (hi + gap) : (lo - gap)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIOF — UDT DECLARATIONS (global scope, required before use)
+// ═══════════════════════════════════════════════════════════════════════════
+type HiofFVGData
+    int   barIdx
+    float top
+    float bot
+    bool  isBull
+    box   bx
+    bool  filled
+
+type HiofOBData
+    int   barIdx
+    float top
+    float bot
+    bool  isBull
+    bool  isSweep
+    box   bx
+    bool  mitigated
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA REQUESTS — All unconditional (Pine requires global-scope requests)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Marker pipeline ---
+string _safeContTF = isMarkerLTF ? ltfChild : containerTF
+[cO, cH, cL, cC, cV, cT] = request.security_lower_tf(syminfo.tickerid, _safeContTF, [open, high, low, close, volume, time])
+[chO, chH, chL, chC, chV, chT] = request.security_lower_tf(syminfo.tickerid, ltfChild, [open, high, low, close, volume, time])
+// FIX 2.2 — removed: float htfContVol = request.security(..., containerTF, volume, ..., barmerge.lookahead_on)
+//           (on history it leaked the finished container's volume into its first child bar)
+
+// --- HVMV pipeline ---
+string _safeHvmvContTF = isHvmvLTF ? ltfChild : hvmvHTF
+[hvmvCO, hvmvCH, hvmvCL, hvmvCC, hvmvCV, hvmvCT] = request.security_lower_tf(syminfo.tickerid, _safeHvmvContTF, [open, high, low, close, volume, time])
+string _safeHvmvChTF = hvmvChildIsChart or isHvmvLTF ? ltfChild : hvmvChildTF
+[hvmvChO, hvmvChH, hvmvChL, hvmvChC, hvmvChV, hvmvChT] = request.security_lower_tf(syminfo.tickerid, _safeHvmvChTF, [open, high, low, close, volume, time])
+
+// --- Reference levels (combined: prev day + day-before-yesterday) ---
+[prevD1H, prevD1L, prevD1C, prevD2H, prevD2L, prevD2C] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1], high[2], low[2], close[2]], lookahead=barmerge.lookahead_on)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT STATE
+// ═══════════════════════════════════════════════════════════════════════════
+var array<float> pctHist  = array.new_float()
+var array<float> volHist  = array.new_float()
+var array<float> excHist  = array.new_float()
+var float baseMean = na
+var float baseMed  = na
+var float avgVol   = na
+var float dynT1 = staticT1Input
+var float dynT2 = staticT2Input
+var float dynT3 = staticT3Input
+var int lastProcTime = 0
+var float hvmvPOC    = na
+var float hvmvVolume = na
+
+if ta.change(time(htfDaily)) != 0
+    hvmvPOC    := na
+    hvmvVolume := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKER PROCESSING — HTF MODE (chart >= container)
+// Anti-spill: only keep the BEST qualifying container per chart bar
+// ═══════════════════════════════════════════════════════════════════════════
+int contDurMs = timeframe.in_seconds(containerTF) * 1000
+float barVol       = 0.0
+float htf_bestVol  = 0.0
+float htf_bestPOC  = na
+float htf_bestContrib = na
+
+if not isMarkerLTF
+    int numC  = array.size(cV)
+    int numCh = array.size(chV)
+    if numC > 0
+        for i = 0 to numC - 1
+            int ct  = array.get(cT, i)
+            float cv = array.get(cV, i)
+            if f_inSess(ct) and cv > 0
+                barVol += cv
+                int cEnd = ct + contDurMs
+                float mxV = 0.0
+                float mxPOC = na
+                float sumCh = 0.0   // FIX 2.3 — this container's own child-volume total
+                int   cntCh = 0     // FIX 2.1 — how many child bars actually arrived
+                if numCh > 0
+                    for j = 0 to numCh - 1
+                        int cht = array.get(chT, j)
+                        if cht >= ct and cht < cEnd and f_inSess(cht)
+                            float chvol = nz(array.get(chV, j))
+                            sumCh += chvol
+                            cntCh += 1
+                            if chvol > mxV
+                                mxV := chvol
+                                mxPOC := f_poc(array.get(chO, j), array.get(chH, j), array.get(chL, j), array.get(chC, j))
+                // FIX 2.3 — denominator is the sum of the children, not the container feed's volume
+                float contrib = sumCh > 0 and mxV > 0 ? mxV / sumCh * 100.0 : na
+                // FIX 2.1 — only a closed chart bar with a complete container is scored
+                bool complete = not requireComplete or cntCh >= f_expChildren(ct)
+                if barstate.isconfirmed and complete
+                    if mxV > htf_bestVol
+                        htf_bestVol    := mxV
+                        htf_bestPOC    := mxPOC
+                        htf_bestContrib := contrib
+                    if ct > lastProcTime
+                        if not na(contrib)
+                            array.push(pctHist, contrib)
+                            if array.size(pctHist) > baselineLookback
+                                array.shift(pctHist)
+                        if mxV > 0
+                            array.push(volHist, mxV)
+                            if array.size(volHist) > volumeLookback
+                                array.shift(volHist)
+                        lastProcTime := math.max(lastProcTime, ct)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKER PROCESSING — LTF MODE (chart < container)
+// ═══════════════════════════════════════════════════════════════════════════
+int _markerContChange = ta.change(time(containerTF))
+bool newMarkerCont = isMarkerLTF and _markerContChange != 0
+// FIX 2.2 — the container is finished on its last chart bar (or the session's last bar)
+bool ltfContEnd = isMarkerLTF and barstate.isconfirmed and (time_close == time_close(containerTF) or session.islastbar_regular)
+
+var float ltf_bestVol    = 0.0
+var float ltf_bestPOC    = na
+var float ltf_bestContrib = na
+var int   ltf_bestBarIdx  = 0
+var label ltf_markerLbl   = na
+var label ltf_volLbl      = na
+var int   ltf_labeledTier = 0
+var float ltf_contSum     = 0.0   // FIX 2.2 / 2.3 — running child-volume sum for this container
+var int   ltf_childCnt    = 0     // FIX 2.2 — child bars seen in this container
+var int   ltf_contStartT  = na    // FIX 2.2 — container open time (for the completeness check)
+
+if isMarkerLTF
+    if newMarkerCont
+        if barstate.isconfirmed or bar_index > 0
+            // FIX 2.2 — only containers that were finalised at their close enter the history
+            if not na(ltf_bestContrib) and ltf_bestContrib > 0
+                array.push(pctHist, ltf_bestContrib)
+                if array.size(pctHist) > baselineLookback
+                    array.shift(pctHist)
+                if ltf_bestVol > 0
+                    array.push(volHist, ltf_bestVol)
+                    if array.size(volHist) > volumeLookback
+                        array.shift(volHist)
+        ltf_bestVol     := 0.0
+        ltf_bestPOC     := na
+        ltf_bestContrib := na
+        ltf_bestBarIdx  := bar_index
+        ltf_markerLbl   := na
+        ltf_volLbl      := na
+        ltf_labeledTier := 0
+        ltf_contSum     := 0.0
+        ltf_childCnt    := 0
+        ltf_contStartT  := time(containerTF)
+
+    int nCh = array.size(chV)
+    if nCh > 0
+        for j = 0 to nCh - 1
+            if f_inSess(array.get(chT, j))
+                float chvol = nz(array.get(chV, j))
+                ltf_contSum  += chvol
+                ltf_childCnt += 1
+                if chvol > ltf_bestVol
+                    ltf_bestVol    := chvol
+                    ltf_bestPOC    := f_poc(array.get(chO, j), array.get(chH, j), array.get(chL, j), array.get(chC, j))
+                    ltf_bestBarIdx := bar_index
+    // FIX 2.2 / 2.3 — the share is only known once the container has closed:
+    //                 biggest child / sum of ALL its children (no partial denominator, no lookahead)
+    if ltfContEnd and ltf_bestVol > 0 and ltf_contSum > 0
+        int expCh = f_expChildren(na(ltf_contStartT) ? time(containerTF) : ltf_contStartT)
+        if not requireComplete or ltf_childCnt >= expCh
+            ltf_bestContrib := ltf_bestVol / ltf_contSum * 100.0
+    barVol := ltf_contSum
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HVMV PROCESSING — HTF MODE (chart >= hvmvHTF)
+// Pure max-volume child POC per container. No baseline / exceedance.
+// ═══════════════════════════════════════════════════════════════════════════
+int hvmvContDurMs = timeframe.in_seconds(hvmvHTF) * 1000
+float hvmv_htf_bestVol = 0.0
+float hvmv_htf_poc     = na
+
+if not isHvmvLTF
+    int numHC  = array.size(hvmvCV)
+    int numHCh = array.size(hvmvChV)
+    if numHC > 0
+        for i = 0 to numHC - 1
+            int hct = array.get(hvmvCT, i)
+            if f_inSess(hct)
+                int hcEnd = hct + hvmvContDurMs
+                float hmxV   = 0.0
+                float hmxPOC = na
+                if numHCh > 0
+                    for j = 0 to numHCh - 1
+                        int hcht = array.get(hvmvChT, j)
+                        if hcht >= hct and hcht < hcEnd and f_inSess(hcht)
+                            float hchvol = array.get(hvmvChV, j)
+                            if hchvol > hmxV
+                                hmxV  := hchvol
+                                hmxPOC := f_poc(array.get(hvmvChO, j), array.get(hvmvChH, j), array.get(hvmvChL, j), array.get(hvmvChC, j))
+                // Last container with valid POC wins (most recent in time)
+                if hmxV > 0 and not na(hmxPOC)
+                    hvmv_htf_poc     := hmxPOC
+                    hvmv_htf_bestVol := hmxV
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HVMV PROCESSING — LTF MODE (chart < hvmvHTF)
+// ═══════════════════════════════════════════════════════════════════════════
+int _hvmvContChange = ta.change(time(hvmvHTF))
+bool newHvmvCont = isHvmvLTF and _hvmvContChange != 0
+
+var float hvmvLtf_bestVol = 0.0
+var float hvmvLtf_bestPOC = na
+
+if isHvmvLTF
+    if newHvmvCont
+        hvmvLtf_bestVol := 0.0
+        hvmvLtf_bestPOC := na
+
+    if hvmvChildIsChart
+        if f_inSess(time) and volume > hvmvLtf_bestVol
+            hvmvLtf_bestVol := volume
+            hvmvLtf_bestPOC := f_poc(open, high, low, close)
+    else
+        int nHCh = array.size(hvmvChV)
+        if nHCh > 0
+            for j = 0 to nHCh - 1
+                if f_inSess(array.get(hvmvChT, j))
+                    float hchvol = array.get(hvmvChV, j)
+                    if hchvol > hvmvLtf_bestVol
+                        hvmvLtf_bestVol := hchvol
+                        hvmvLtf_bestPOC := f_poc(array.get(hvmvChO, j), array.get(hvmvChH, j), array.get(hvmvChL, j), array.get(hvmvChC, j))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HVMV UPDATE — Unified
+// ═══════════════════════════════════════════════════════════════════════════
+float hvmvNewPOC = isHvmvLTF ? hvmvLtf_bestPOC : hvmv_htf_poc
+float hvmvNewVol = isHvmvLTF ? hvmvLtf_bestVol : hvmv_htf_bestVol
+if not na(hvmvNewPOC)
+    hvmvPOC := hvmvNewPOC
+if hvmvNewVol > 0
+    hvmvVolume := hvmvNewVol
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MERGE — Marker unified output regardless of mode
+// ═══════════════════════════════════════════════════════════════════════════
+float maxChildVol  = isMarkerLTF ? ltf_bestVol     : htf_bestVol
+float maxChildPOC  = isMarkerLTF ? ltf_bestPOC     : htf_bestPOC
+float maxContrib   = isMarkerLTF ? ltf_bestContrib : htf_bestContrib
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BASELINE CALCULATIONS — Markers
+// ═══════════════════════════════════════════════════════════════════════════
+int pSz = array.size(pctHist)
+if pSz >= 10
+    baseMean := array.avg(pctHist)
+    baseMed  := array.percentile_linear_interpolation(pctHist, 50)
+int vSz = array.size(volHist)
+if vSz >= 20
+    avgVol := array.avg(volHist)
+
+float baseline    = math.max(nz(baseMean), nz(baseMed))
+bool exceedsBase  = not na(maxContrib) and maxContrib > nz(baseMean) and maxContrib > nz(baseMed)
+float excPct      = baseline > 0 and not na(maxContrib) ? (maxContrib - baseline) / baseline * 100.0 : na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXCEEDANCE HISTORY + DYNAMIC TIERS
+// ═══════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed and not na(excPct) and excPct > 0
+    array.push(excHist, excPct)
+    if array.size(excHist) > exceedanceLookback
+        array.shift(excHist)
+
+int eSz = array.size(excHist)
+bool dynActive = useDynamicTiers and eSz >= minHistoryForDynamic
+if dynActive
+    float t1v = array.percentile_linear_interpolation(excHist, tier1Percentile)
+    float t2v = array.percentile_linear_interpolation(excHist, tier2Percentile)
+    float t3v = array.percentile_linear_interpolation(excHist, tier3Percentile)
+    dynT1 := math.max(1.0, nz(t1v, staticT1Input))
+    dynT2 := math.max(dynT1 + 0.1, nz(t2v, staticT2Input))
+    dynT3 := math.max(dynT2 + 0.1, nz(t3v, staticT3Input))
+
+float actT1 = dynActive ? dynT1 : staticT1Input
+float actT2 = dynActive ? dynT2 : staticT2Input
+float actT3 = dynActive ? dynT3 : staticT3Input
+
+float volThresh = nz(avgVol) * minVolumePctOfAvg / 100.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIER QUALIFICATION
+// ═══════════════════════════════════════════════════════════════════════════
+bool meetsVol      = maxChildVol >= volThresh
+bool tier1Qualifies = exceedsBase and not na(excPct) and excPct >= actT1 and meetsVol and not na(maxChildPOC)
+bool tier2Qualifies = exceedsBase and not na(excPct) and excPct >= actT2 and meetsVol and not na(maxChildPOC)
+bool tier3Qualifies = exceedsBase and not na(excPct) and excPct >= actT3 and meetsVol and not na(maxChildPOC)
+int currentTier = tier3Qualifies ? 3 : tier2Qualifies ? 2 : tier1Qualifies ? 1 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION — HTF MODE (chart >= container)
+// ═══════════════════════════════════════════════════════════════════════════
+float tier1POC = na
+
+// FIX 2.1 — draw only on confirmed bars (the "●" marker was previously drawn on the live bar)
+if not isMarkerLTF and not _clean and barstate.isconfirmed
+    if tier1Qualifies and not tier2Qualifies
+        tier1POC := maxChildPOC
+        if showAnyVolLabel and barstate.isconfirmed
+            bool _t1Bull = close >= open
+            float _t1Y = f_labelY(_t1Bull, high, low, open, close)
+            label.new(bar_index, _t1Y, f_buildVolLabel(maxChildVol, maxContrib), style=label.style_none, textcolor=colorTier1, size=volLabelSize)
+    if tier2Qualifies
+        if showMarkers
+            color tCol = tier3Qualifies ? colorTier3 : colorTier2
+            label.new(bar_index, maxChildPOC, "●", style=label.style_none, textcolor=tCol, size=markerExcSize)
+            if showAnyVolLabel and barstate.isconfirmed
+                bool _t2Bull = close >= open
+                float _t2Y = f_labelY(_t2Bull, high, low, open, close)
+                label.new(bar_index, _t2Y, f_buildVolLabel(maxChildVol, maxContrib), style=label.style_none, textcolor=tCol, size=volLabelSize)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION — LTF MODE (chart < container)
+// ═══════════════════════════════════════════════════════════════════════════
+if isMarkerLTF
+    bool tierChanged = currentTier != ltf_labeledTier
+    bool barChanged  = ltf_bestBarIdx != (ltf_labeledTier != 0 ? ltf_bestBarIdx : -1)
+    bool needsRedraw = (currentTier > 0 and (tierChanged or ltf_labeledTier == 0)) or (currentTier == 0 and ltf_labeledTier > 0)
+
+    if not na(ltf_markerLbl)
+        int prevLblBar = label.get_x(ltf_markerLbl)
+        if prevLblBar != ltf_bestBarIdx
+            needsRedraw := true
+
+    if needsRedraw or newMarkerCont
+        if not na(ltf_markerLbl)
+            label.delete(ltf_markerLbl)
+            ltf_markerLbl := na
+        if not na(ltf_volLbl)
+            label.delete(ltf_volLbl)
+            ltf_volLbl := na
+        ltf_labeledTier := 0
+
+    if currentTier > 0 and not na(ltf_bestPOC) and not _clean and (needsRedraw or newMarkerCont or ltf_labeledTier == 0)
+        color tCol = currentTier >= 3 ? colorTier3 : currentTier >= 2 ? colorTier2 : colorTier1
+        int tgtBar = ltf_bestBarIdx
+        int offset = bar_index - tgtBar
+        float tgtLow   = offset >= 0 and offset < 5000 ? low[offset]   : low
+        float tgtHigh  = offset >= 0 and offset < 5000 ? high[offset]  : high
+        float tgtOpen  = offset >= 0 and offset < 5000 ? open[offset]  : open
+        float tgtClose = offset >= 0 and offset < 5000 ? close[offset] : close
+        bool  tgtBull  = tgtClose >= tgtOpen
+
+        if showMarkers
+            ltf_markerLbl := label.new(tgtBar, ltf_bestPOC, "●", style=label.style_none, textcolor=tCol, size=currentTier >= 2 ? markerExcSize : size.small)
+        if showAnyVolLabel
+            float _ltfY = f_labelY(tgtBull, tgtHigh, tgtLow, tgtOpen, tgtClose)
+            ltf_volLbl := label.new(tgtBar, _ltfY, f_buildVolLabel(ltf_bestVol, ltf_bestContrib), style=label.style_none, textcolor=tCol, size=volLabelSize)
+        ltf_labeledTier := currentTier
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(showHVMV and not _clean ? hvmvPOC : na, "HVMV", color.new(hvmvColor, hvmvTrans), 1, plot.style_stepline, display=display.all - display.status_line)
+plot(showMarkers and not isMarkerLTF and not _clean ? tier1POC : na, "Tier1 POC", colorTier1, 2, plot.style_circles, display=display.pane)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION VWAP
+// ═══════════════════════════════════════════════════════════════════════════
+bool inSess  = f_inSess(time)
+bool newSess = inSess and (not f_inSess(time[1]) or dayofmonth != dayofmonth[1])
+var float vwPV = 0.0
+var float vwV  = 0.0
+var float prevDayVWAPCalc = na
+var float prevPrevDayVWAP = na
+
+if newSess
+    prevPrevDayVWAP := prevDayVWAPCalc
+    if vwV > 0
+        prevDayVWAPCalc := vwPV / vwV
+    vwPV := 0.0
+    vwV  := 0.0
+if inSess
+    vwPV += hlc3 * volume
+    vwV  += volume
+float currentVWAP = vwV > 0 ? vwPV / vwV : na
+bool isLatestTradingDay = year(time) == year(last_bar_time) and month(time) == month(last_bar_time) and dayofmonth(time) == dayofmonth(last_bar_time)
+
+plot(showSessVWAP and inSess and isLatestTradingDay and not _clean ? currentVWAP : na, "VWAP", color.new(sessVWAPColor, sessVWAPTrans), 1, plot.style_line, linestyle=plot.linestyle_dashed, display=display.pane)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PREVIOUS DAY LEVELS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(showDayHL and not _clean ? prevD1H : na, "PDH", color.new(dayHighColor, 70), dayWeekLineWidth, plot.style_stepline, display=display.pane)
+plot(showDayHL and not _clean ? prevD1L : na, "PDL", color.new(dayLowColor, 70), dayWeekLineWidth, plot.style_stepline, display=display.pane)
+plot(showDayHL and not _clean ? prevDayVWAPCalc : na, "PDV", color.new(dayVWAPColor, 50), dayWeekLineWidth, plot.style_stepline, linestyle=plot.linestyle_dashed, display=display.pane)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATUS LINE
+// ═══════════════════════════════════════════════════════════════════════════
+float volPctl = f_pctRank(volHist, maxChildVol)
+plot(math.ceil(nz(avgVol)), "Avg Child Vol", display=display.status_line, format=format.volume, color=color.rgb(255, 111, 226))
+// FIX 2.1 — blank (not 0) while the container is still forming
+plot(not na(maxContrib) ? math.ceil(maxContrib) : na, "Child %", display=display.status_line, color=color.rgb(27, 241, 109))
+plot(math.ceil(nz(baseMed)), "Median %", display=display.status_line, color=color.rgb(173, 178, 159))
+plot(math.ceil(maxChildVol), "Child Vol", display=display.status_line, format=format.volume, color=color.rgb(85, 255, 244))
+plot(not na(hvmvVolume) ? math.ceil(hvmvVolume) : na, "HVMV Vol", display=display.status_line, format=format.volume, color=color.rgb(72, 232, 3))
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDENDUM A — DAILY REGIME HYPOTHESIS (Static, Non-Repainting)
+// ═══════════════════════════════════════════════════════════════════════════
+// Calculated ONCE at session start from D-1 and D-2 structure.
+// Does NOT flip intraday. Purely a pre-market structural hypothesis.
+//
+// BULLISH: D1Close > (D1High + D1VWAP)/2 AND (higher structure OR VWAP trend)
+// BEARISH: D1Close < (D1Low + D1VWAP)/2 AND (lower structure OR VWAP trend)
+// NEUTRAL: neither condition met → no shading
+// ═══════════════════════════════════════════════════════════════════════════
+
+grpRegime        = "Day Regime Background"
+showRegimeBG     = input.bool(true, "Show Day Regime Shading", group=grpRegime)
+regimeBullColor  = input.color(color.rgb(14, 54, 14), "Bullish Day Color", group=grpRegime)
+regimeBearColor  = input.color(color.rgb(57, 7, 7), "Bearish Day Color", group=grpRegime)
+regimeBullTrans  = input.int(80, "Bullish Transparency", minval=0, maxval=100, group=grpRegime)
+regimeBearTrans  = input.int(80, "Bearish Transparency", minval=0, maxval=100, group=grpRegime)
+
+var int rgState = 0
+
+if newSess
+    float d1H = prevD1H
+    float d1L = prevD1L
+    float d1C = prevD1C
+    float d1V = prevDayVWAPCalc
+    float d2H = prevD2H
+    float d2L = prevD2L
+    float d2C = prevD2C
+    float d2V = prevPrevDayVWAP
+    bool dataOk = not na(d1H) and not na(d1L) and not na(d1C) and not na(d1V) and not na(d2H) and not na(d2L) and not na(d2V)
+    if dataOk
+        bool bullC1 = d1C > (d1H + d1V) / 2.0
+        bool bullC2 = d1H > d2H and d1L > d2L
+        bool bullC3 = d1L > d2L and d1V > d2V
+        bool bearC1 = d1C < (d1L + d1V) / 2.0
+        bool bearC2 = d1H < d2H and d1L < d2L
+        bool bearC3 = d1H < d2H and d1V < d2V
+        if bullC1 and (bullC2 or bullC3)
+            rgState := 1
+        else if bearC1 and (bearC2 or bearC3)
+            rgState := -1
+        else
+            rgState := 0
+    else
+        rgState := 0
+
+color rgBG = showRegimeBG and not _clean and rgState == 1 ? color.new(regimeBullColor, regimeBullTrans) : showRegimeBG and not _clean and rgState == -1 ? color.new(regimeBearColor, regimeBearTrans) : na
+bgcolor(rgBG, title="Day Regime")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDENDUM B — VOLUME ANOMALY · CANDLE BORDER ACCENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────────
+// V1 · INPUTS — CORE
+// ───────────────────────────────────────────────────────────────────────────
+grpVACore         = "Volume Anomaly — Core"
+showVolAnomaly    = input.bool(true, "Enable Volume Anomaly Highlight", group=grpVACore)
+vaNumSlots        = input.int(25, "Opening Candles to Evaluate", minval=1, maxval=75, group=grpVACore)
+vaLookback        = input.int(100, "Historical Lookback (sessions)", minval=10, maxval=500, group=grpVACore)
+vaMethodInput     = input.string("Blended", "Expected Volume Method", options=["Mean", "Median", "Blended"], group=grpVACore)
+vaBaseThreshold   = input.float(1.0, "Tier 1 RV Threshold (base)", minval=0.5, maxval=5.0, step=0.1, group=grpVACore, tooltip="Minimum Relative Volume (actual / expected) to qualify as anomaly.")
+
+// ───────────────────────────────────────────────────────────────────────────
+// V2 · INPUTS — VISUAL
+// ───────────────────────────────────────────────────────────────────────────
+grpVAVisual       = "Volume Anomaly — Visual"
+vaBullBorderColor = input.color(color.rgb(0, 200, 0), "Bullish Border Color", group=grpVAVisual)
+vaBearBorderColor = input.color(color.rgb(245, 176, 238), "Bearish Border Color", group=grpVAVisual)
+vaAccentWicks     = input.bool(true, "Accent Wicks", group=grpVAVisual, tooltip="Apply the same accent to candle wicks.")
+
+// ───────────────────────────────────────────────────────────────────────────
+// V3 · INPUTS — INTENSITY TIERS
+// ───────────────────────────────────────────────────────────────────────────
+grpVATiers        = "Volume Anomaly — Intensity Tiers"
+vaT1Trans         = input.int(65, "Tier 1 Transparency (mild)", minval=0, maxval=95, group=grpVATiers, tooltip="Applied when RV >= Tier 1 threshold.")
+vaT2Threshold     = input.float(1.5, "Tier 2 RV Threshold", minval=1.0, maxval=5.0, step=0.1, group=grpVATiers)
+vaT2Trans         = input.int(35, "Tier 2 Transparency (moderate)", minval=0, maxval=95, group=grpVATiers)
+vaT3Threshold     = input.float(2.0, "Tier 3 RV Threshold", minval=1.0, maxval=10.0, step=0.1, group=grpVATiers)
+vaT3Trans         = input.int(10, "Tier 3 Transparency (strong)", minval=0, maxval=95, group=grpVATiers, tooltip="Lower value = more opaque = more prominent accent.")
+
+// ───────────────────────────────────────────────────────────────────────────
+// V4 · SESSION BAR COUNTER
+// ───────────────────────────────────────────────────────────────────────────
+var int vaSessionStartBI = na
+
+if newSess or (inSess and na(vaSessionStartBI))
+    vaSessionStartBI := bar_index
+if not inSess
+    vaSessionStartBI := na
+
+int vaSlotIdx = inSess and not na(vaSessionStartBI) ? bar_index - vaSessionStartBI + 1 : 0
+
+// ───────────────────────────────────────────────────────────────────────────
+// V5 · SLOT HISTORIES — flat ring buffer
+// ───────────────────────────────────────────────────────────────────────────
+var int VA_MAX_SLOTS = 75
+var array<float> _vaFlat = array.new_float(VA_MAX_SLOTS * vaLookback, na)
+var array<int>   _vaWr   = array.new_int(VA_MAX_SLOTS, 0)
+var array<int>   _vaCnt  = array.new_int(VA_MAX_SLOTS, 0)
+
+// ───────────────────────────────────────────────────────────────────────────
+// V6 · EXPECTED VOLUME
+// ───────────────────────────────────────────────────────────────────────────
+f_vaExpectedSlot(int slot) =>
+    int cnt = array.get(_vaCnt, slot)
+    if cnt < 2
+        float(na)
+    else
+        int base = slot * vaLookback
+        int n = math.min(cnt, vaLookback)
+        array<float> _tmp = array.new_float(0)
+        for i = 0 to n - 1
+            float v = array.get(_vaFlat, base + i)
+            if not na(v)
+                array.push(_tmp, v)
+        int tsz = array.size(_tmp)
+        if tsz < 2
+            float(na)
+        else
+            float mn = array.avg(_tmp)
+            float md = array.percentile_linear_interpolation(_tmp, 50)
+            vaMethodInput == "Mean" ? mn : vaMethodInput == "Median" ? md : (mn + md) / 2.0
+
+// ───────────────────────────────────────────────────────────────────────────
+// V7 · PROCESS — compare THEN update
+// ───────────────────────────────────────────────────────────────────────────
+f_vaProcessSlot(int slot, float vol) =>
+    float _exp = f_vaExpectedSlot(slot)
+    float _rv  = not na(_exp) and _exp > 0.0 ? vol / _exp : na
+    int base = slot * vaLookback
+    int wr   = array.get(_vaWr, slot)
+    array.set(_vaFlat, base + wr, vol)
+    array.set(_vaWr, slot, (wr + 1) % vaLookback)
+    int cnt = array.get(_vaCnt, slot)
+    if cnt < vaLookback
+        array.set(_vaCnt, slot, cnt + 1)
+    _rv
+
+// ───────────────────────────────────────────────────────────────────────────
+// V8 · MAIN DISPATCH
+// ───────────────────────────────────────────────────────────────────────────
+float vaRV = na
+
+if showVolAnomaly and inSess and vaSlotIdx >= 1 and vaSlotIdx <= vaNumSlots and barstate.isconfirmed
+    vaRV := f_vaProcessSlot(vaSlotIdx - 1, volume)
+
+// ───────────────────────────────────────────────────────────────────────────
+// V9 · ANOMALY FLAG · TIER · COLOR
+// ───────────────────────────────────────────────────────────────────────────
+bool vaIsAnomaly  = not na(vaRV) and vaRV >= vaBaseThreshold
+int  vaTier       = vaIsAnomaly ? (vaRV >= vaT3Threshold ? 3 : vaRV >= vaT2Threshold ? 2 : 1) : 0
+int  vaTrans      = vaTier == 3 ? vaT3Trans : vaTier == 2 ? vaT2Trans : vaT1Trans
+bool vaBullCandle = close >= open
+
+color vaBorderCol = na
+color vaWickCol   = na
+
+if vaIsAnomaly
+    color _base = vaBullCandle ? vaBullBorderColor : vaBearBorderColor
+    vaBorderCol := color.new(_base, vaTrans)
+    vaWickCol   := vaAccentWicks ? color.new(_base, vaTrans) : na
+
+// ───────────────────────────────────────────────────────────────────────────
+// V10 · PLOTCANDLE RENDER
+// ───────────────────────────────────────────────────────────────────────────
+bool _vaShow = vaIsAnomaly and not _clean
+plotcandle(_vaShow ? open : na, _vaShow ? high : na, _vaShow ? low : na, _vaShow ? close : na, "VA Border Accent", color=color.new(color.black, 100), wickcolor=vaWickCol, bordercolor=vaBorderCol, display=display.pane)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VA EXCEEDANCE — STATUS LINE
+// ═══════════════════════════════════════════════════════════════════════════
+plot(not na(vaRV) ? math.round((vaRV - 1.0) * 100.0) : na, "VA Exc %", display=display.status_line, color=color.rgb(255, 165, 0))
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDENDUM C — HYBRID INSTITUTIONAL ORDER FLOW (HIOF v3)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Confluence-based OB + FVG detection with:
+//   · Cross-session FVG invalidation (NSE overnight gap fix)
+//   · Opening volume skew normalization
+//   · Volume displacement tied to FVG candle[1], not BOS bar
+//   · Execution order: FVG → BOS → OB (sequencing fix)
+//   · Dual FVG tracking: structural (display) + volume-displaced (confluence)
+//   · Mitigation gated on barstate.isconfirmed (no wick repaint)
+//   · OB boxes use extend.right; mitigation anchors with extend.none
+//   · Non-repainting alerts on all paths
+//
+// All variables prefixed hiof_ to guarantee zero collision with NF core.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────────
+// C1 · SESSION BOOLEANS — derived from NF's existing f_inSess()
+// ───────────────────────────────────────────────────────────────────────────
+bool hiof_inSess    = f_inSess(time)    // reuses NF's session function
+bool hiof_isOpenBar = useSession and (hour * 60 + minute == SESS_START_MINS)
+
+// ───────────────────────────────────────────────────────────────────────────
+// C2 · VOLUME NORMALIZATION — independent pipeline for HIOF's EMA
+// ───────────────────────────────────────────────────────────────────────────
+var array<float> hiof_volRingBuf = array.new_float(0)
+var float hiof_volCap = na
+
+if hiof_inSess and not hiof_isOpenBar and volume > 0
+    array.push(hiof_volRingBuf, volume)
+    if array.size(hiof_volRingBuf) > hiof_volCapLookback
+        array.shift(hiof_volRingBuf)
+
+// Percentile only needed on the opening bar — cache it, skip 375 bars/session
+if hiof_isOpenBar and array.size(hiof_volRingBuf) >= 20
+    hiof_volCap := array.percentile_linear_interpolation(hiof_volRingBuf, hiof_volCapPercentile)
+
+float hiof_adjVol = volume
+if hiof_isOpenBar and hiof_volCapMethod != "None"
+    if hiof_volCapMethod == "Cap" and not na(hiof_volCap)
+        hiof_adjVol := math.min(volume, hiof_volCap)
+    else if hiof_volCapMethod == "Exclude"
+        hiof_adjVol := nz(hiof_volCap, volume)
+
+float hiof_volEMA = ta.ema(hiof_adjVol, hiof_obVolEmaLen)
+
+// ───────────────────────────────────────────────────────────────────────────
+// C3 · DUAL-TIMEFRAME PIVOT ARCHITECTURE
+// ───────────────────────────────────────────────────────────────────────────
+// 5m pivots: chart-TF pivots driving the OB/BOS pipeline.
+// 15m pivots: pulled via request.security for HTF structural reference.
+// Volume filter applied to 5m pivots only.
+
+float hiof_pvtHi = ta.pivothigh(high, hiof_pivotLeft_5m, hiof_pivotRight_5m)
+float hiof_pvtLo = ta.pivotlow(low, hiof_pivotLeft_5m, hiof_pivotRight_5m)
+
+float hiof_pvtBarVol    = volume[hiof_pivotRight_5m]
+float hiof_pvtVolThresh = nz(hiof_volEMA[hiof_pivotRight_5m]) * hiof_pivotVolPct / 100.0
+bool  hiof_pvtVolOk     = not hiof_pivotVolFilter or hiof_pvtBarVol >= hiof_pvtVolThresh
+
+var float hiof_activePH     = na
+var float hiof_activePL     = na
+var int   hiof_activePH_bar = na
+var int   hiof_activePL_bar = na
+var float hiof_prevPL       = na
+var float hiof_prevPH       = na
+
+if not na(hiof_pvtHi) and hiof_pvtVolOk
+    hiof_prevPH       := hiof_activePH
+    hiof_activePH     := hiof_pvtHi
+    hiof_activePH_bar := bar_index - hiof_pivotRight_5m
+    if hiof_showPivots and not _clean
+        label.new(bar_index - hiof_pivotRight_5m, hiof_pvtHi, "PH5", style=label.style_triangledown, color=color.new(color.red, 60), textcolor=color.white, size=size.tiny)
+
+if not na(hiof_pvtLo) and hiof_pvtVolOk
+    hiof_prevPL       := hiof_activePL
+    hiof_activePL     := hiof_pvtLo
+    hiof_activePL_bar := bar_index - hiof_pivotRight_5m
+    if hiof_showPivots and not _clean
+        label.new(bar_index - hiof_pivotRight_5m, hiof_pvtLo, "PL5", style=label.style_triangleup, color=color.new(color.green, 60), textcolor=color.white, size=size.tiny)
+
+// --- 15-Minute Pivots via request.security ---
+float hiof_pvtHi_15m_raw = request.security(syminfo.tickerid, "15", ta.pivothigh(high, hiof_pivotLeft_15m, hiof_pivotRight_15m), barmerge.gaps_off, barmerge.lookahead_on)
+float hiof_pvtLo_15m_raw = request.security(syminfo.tickerid, "15", ta.pivotlow(low, hiof_pivotLeft_15m, hiof_pivotRight_15m), barmerge.gaps_off, barmerge.lookahead_on)
+
+var float hiof_active15mPH = na
+var float hiof_active15mPL = na
+
+if not na(hiof_pvtHi_15m_raw) and hiof_pvtHi_15m_raw != hiof_active15mPH
+    hiof_active15mPH := hiof_pvtHi_15m_raw
+    if hiof_show15mPivots and not _clean
+        label.new(bar_index, hiof_pvtHi_15m_raw, "PH15", style=label.style_triangledown, color=color.new(color.orange, 40), textcolor=color.white, size=size.tiny)
+
+if not na(hiof_pvtLo_15m_raw) and hiof_pvtLo_15m_raw != hiof_active15mPL
+    hiof_active15mPL := hiof_pvtLo_15m_raw
+    if hiof_show15mPivots and not _clean
+        label.new(bar_index, hiof_pvtLo_15m_raw, "PL15", style=label.style_triangleup, color=color.new(color.orange, 40), textcolor=color.white, size=size.tiny)
+
+// ───────────────────────────────────────────────────────────────────────────
+// C4 · FAIR VALUE GAPS — runs BEFORE BOS (sequencing fix)
+// ───────────────────────────────────────────────────────────────────────────
+var array<HiofFVGData> hiof_fvgArray = array.new<HiofFVGData>(0)
+var array<box> hiof_stdFvgBoxes = array.new<box>(0)  // tracked for cleanup
+
+bool hiof_sameSession3 = time("D") == time("D")[2]
+
+bool hiof_bullFVG_struct = hiof_sameSession3 and low > high[2] and close[1] > open[1]
+bool hiof_bearFVG_struct = hiof_sameSession3 and high < low[2] and close[1] < open[1]
+
+bool hiof_isDisplacedVol = nz(volume[1]) > (nz(hiof_volEMA[1]) * hiof_obVolMult)
+
+bool hiof_bullFVG = hiof_bullFVG_struct and hiof_isDisplacedVol
+bool hiof_bearFVG = hiof_bearFVG_struct and hiof_isDisplacedVol
+
+if barstate.isconfirmed and hiof_inSess
+    // --- Structural FVG boxes (tracked for cleanup) ---
+    if hiof_showFVG and hiof_showStdFVG and not _clean
+        if hiof_bullFVG_struct
+            array.push(hiof_stdFvgBoxes, box.new(bar_index - 1, low, bar_index + hiof_fvgMaxBars, high[2], border_color=color.new(hiof_fvgBullColor, 70), bgcolor=hiof_fvgBullColor))
+        if hiof_bearFVG_struct
+            array.push(hiof_stdFvgBoxes, box.new(bar_index - 1, low[2], bar_index + hiof_fvgMaxBars, high, border_color=color.new(hiof_fvgBearColor, 70), bgcolor=hiof_fvgBearColor))
+        // Cap structural FVG boxes — delete oldest when over limit
+        while array.size(hiof_stdFvgBoxes) > 100
+            box.delete(array.shift(hiof_stdFvgBoxes))
+
+    // --- Volume-displaced FVGs for OB confluence ---
+    if hiof_bullFVG
+        HiofFVGData hiof_newFVG = HiofFVGData.new(bar_index - 1, low, high[2], true, na, false)
+        array.push(hiof_fvgArray, hiof_newFVG)
+    if hiof_bearFVG
+        HiofFVGData hiof_newFVG = HiofFVGData.new(bar_index - 1, low[2], high, false, na, false)
+        array.push(hiof_fvgArray, hiof_newFVG)
+
+    // findOB only scans back 5 entries — 20 is generous headroom
+    while array.size(hiof_fvgArray) > 20
+        array.shift(hiof_fvgArray)
+
+// ───────────────────────────────────────────────────────────────────────────
+// C5 · BREAK OF STRUCTURE — runs AFTER FVG
+// ───────────────────────────────────────────────────────────────────────────
+var int hiof_lastBullBOS_bar = 0
+var int hiof_lastBearBOS_bar = 0
+
+bool hiof_bullBOS_now = false
+bool hiof_bearBOS_now = false
+
+if barstate.isconfirmed and hiof_inSess
+    if not na(hiof_activePH) and close > hiof_activePH and bar_index - hiof_lastBullBOS_bar > hiof_pivotRight_5m
+        hiof_bullBOS_now     := true
+        hiof_lastBullBOS_bar := bar_index
+        if hiof_showBOS and not _clean
+            label.new(bar_index, low, "BOS↑", style=label.style_label_up, color=color.new(color.teal, 40), textcolor=color.white, size=hiof_bosLabelSize == "tiny" ? size.tiny : hiof_bosLabelSize == "small" ? size.small : size.normal)
+
+    if not na(hiof_activePL) and close < hiof_activePL and bar_index - hiof_lastBearBOS_bar > hiof_pivotRight_5m
+        hiof_bearBOS_now     := true
+        hiof_lastBearBOS_bar := bar_index
+        if hiof_showBOS and not _clean
+            label.new(bar_index, high, "BOS↓", style=label.style_label_down, color=color.new(color.red, 40), textcolor=color.white, size=hiof_bosLabelSize == "tiny" ? size.tiny : hiof_bosLabelSize == "small" ? size.small : size.normal)
+
+// ───────────────────────────────────────────────────────────────────────────
+// C6 · GOLDEN SETUP — CONFLUENCE ORDER BLOCKS
+// ───────────────────────────────────────────────────────────────────────────
+var array<HiofOBData> hiof_activeOBs = array.new<HiofOBData>(0)
+
+hiof_findOB(bool isBull, int maxLook) =>
+    float _obTop  = na
+    float _obBot  = na
+    int   _obBar  = na
+    bool  _hasFVG = false
+
+    int fSz = array.size(hiof_fvgArray)
+    if fSz > 0
+        for i = fSz - 1 to math.max(0, fSz - 5)
+            HiofFVGData fg = array.get(hiof_fvgArray, i)
+            if fg.isBull == isBull and bar_index - fg.barIdx <= maxLook
+                _hasFVG := true
+                break
+
+    if _hasFVG
+        for i = 1 to maxLook
+            bool opposing = isBull ? close[i] < open[i] : close[i] > open[i]
+            if opposing
+                _obBar := bar_index - i
+                if isBull
+                    _obTop := hiof_obZoneMode == "Full Candle" ? high[i] : open[i]
+                    _obBot := low[i]
+                else
+                    _obTop := high[i]
+                    _obBot := hiof_obZoneMode == "Full Candle" ? low[i] : open[i]
+                break
+
+    [_obTop, _obBot, _obBar, _hasFVG]
+
+bool hiof_obBullFormed = false
+bool hiof_obBearFormed = false
+
+if barstate.isconfirmed and hiof_inSess
+    if hiof_bullBOS_now
+        [obT, obB, obBI, valid] = hiof_findOB(true, hiof_pivotLeft_5m + hiof_pivotRight_5m + 5)
+        if valid and not na(obT)
+            bool swept = not na(hiof_prevPL) and obB < hiof_prevPL
+            color obCol = hiof_obBullColor
+            box obBox = na
+            if hiof_showOB
+                obBox := box.new(obBI, obT, bar_index, obB, border_color=color.new(obCol, 40), bgcolor=obCol, border_width=1, extend=extend.right)
+            HiofOBData newOB = HiofOBData.new(obBI, obT, obB, true, swept, obBox, false)
+            array.push(hiof_activeOBs, newOB)
+            hiof_obBullFormed := true
+            if swept and hiof_showSweepTag and hiof_showOB and not _clean
+                label.new(obBI, obB, "◆ SWEEP", style=label.style_label_up, color=color.new(hiof_sweepMarkerColor, 20), textcolor=color.black, size=size.tiny)
+
+    if hiof_bearBOS_now
+        [obT, obB, obBI, valid] = hiof_findOB(false, hiof_pivotLeft_5m + hiof_pivotRight_5m + 5)
+        if valid and not na(obT)
+            bool swept = not na(hiof_prevPH) and obT > hiof_prevPH
+            color obCol = hiof_obBearColor
+            box obBox = na
+            if hiof_showOB
+                obBox := box.new(obBI, obT, bar_index, obB, border_color=color.new(obCol, 40), bgcolor=obCol, border_width=1, extend=extend.right)
+            HiofOBData newOB = HiofOBData.new(obBI, obT, obB, false, swept, obBox, false)
+            array.push(hiof_activeOBs, newOB)
+            hiof_obBearFormed := true
+            if swept and hiof_showSweepTag and hiof_showOB and not _clean
+                label.new(obBI, obT, "◆ SWEEP", style=label.style_label_down, color=color.new(hiof_sweepMarkerColor, 20), textcolor=color.black, size=size.tiny)
+
+while array.size(hiof_activeOBs) > hiof_obMaxActive
+    HiofOBData old = array.shift(hiof_activeOBs)
+    if not na(old.bx)
+        box.delete(old.bx)
+
+// ───────────────────────────────────────────────────────────────────────────
+// C7 · MITIGATION — confirmed bars only (no wick repaint)
+//      Also captures bull/bear retest signals for plotshape.
+// ───────────────────────────────────────────────────────────────────────────
+bool hiof_anyMitigated = false
+bool hiof_bullRetest   = false
+bool hiof_bearRetest   = false
+
+if barstate.isconfirmed and array.size(hiof_activeOBs) > 0
+    for i = array.size(hiof_activeOBs) - 1 to 0
+        HiofOBData ob = array.get(hiof_activeOBs, i)
+        if ob.mitigated
+            continue
+
+        bool hit = false
+        if hiof_mitigationMethod == "Close"
+            // Close-based: candle closes inside OR through the zone
+            // Bullish OB (support): mitigated when close reaches or passes below zone top
+            // Bearish OB (resistance): mitigated when close reaches or passes above zone bottom
+            if ob.isBull
+                hit := close <= ob.top
+            else
+                hit := close >= ob.bot
+        else
+            // Wick-based (default): any part of the candle touches or passes through the zone
+            if ob.isBull
+                hit := low <= ob.top and low >= ob.bot or (low <= ob.bot and high >= ob.bot)
+            else
+                hit := high >= ob.bot and high <= ob.top or (high >= ob.top and low <= ob.top)
+
+        if hit
+            ob.mitigated := true
+            hiof_anyMitigated := true
+            if ob.isBull
+                hiof_bullRetest := true
+            else
+                hiof_bearRetest := true
+            if not na(ob.bx)
+                if hiof_showMitigated
+                    box.set_bgcolor(ob.bx, hiof_obMitigatedColor)
+                    box.set_border_color(ob.bx, color.new(color.gray, 80))
+                    box.set_extend(ob.bx, extend.none)
+                    box.set_right(ob.bx, bar_index)
+                else
+                    box.delete(ob.bx)
+
+    for i = array.size(hiof_activeOBs) - 1 to 0
+        if array.get(hiof_activeOBs, i).mitigated
+            array.remove(hiof_activeOBs, i)
+
+// // ───────────────────────────────────────────────────────────────────────────
+// // C8 · ALERTS (all paths gated on barstate.isconfirmed)
+// // ───────────────────────────────────────────────────────────────────────────
+// alertcondition(hiof_obBullFormed, "HIOF: Golden Bullish OB Formed", "HIOF: Bullish Order Block confirmed with FVG + Volume + BOS confluence")
+// alertcondition(hiof_obBearFormed, "HIOF: Golden Bearish OB Formed", "HIOF: Bearish Order Block confirmed with FVG + Volume + BOS confluence")
+// alertcondition(hiof_anyMitigated, "HIOF: OB Mitigated", "HIOF: An active Order Block zone has been mitigated (tapped)")
+
+// ───────────────────────────────────────────────────────────────────────────
+// C9 · STATUS LINE
+// ───────────────────────────────────────────────────────────────────────────
+// plot(array.size(hiof_activeOBs), "HIOF Active OBs", display=display.status_line, color=color.rgb(0, 200, 200))
+// plot(hiof_volEMA, "HIOF Vol EMA", display=display.status_line, color=color.rgb(255, 165, 0))
+
+// ───────────────────────────────────────────────────────────────────────────
+// C10 · BUY / SELL SIGNALS
+// ───────────────────────────────────────────────────────────────────────────
+// Breakout = Golden OB just confirmed (BOS + FVG + Vol confluence)
+// Retest   = Price returns to an active, unmitigated OB zone (institutional entry)
+// Both are non-repainting: gated on barstate.isconfirmed upstream.
+
+// bool hiof_buySignal  = hiof_showSignals and ((hiof_sigBreakout and hiof_obBullFormed) or (hiof_sigRetest and hiof_bullRetest))
+// bool hiof_sellSignal = hiof_showSignals and ((hiof_sigBreakout and hiof_obBearFormed) or (hiof_sigRetest and hiof_bearRetest))
+
+// plotshape(hiof_buySignal,  "Buy",  shape.xcross, location.belowbar, hiof_sigBuyColor,  size=size.small)
+// plotshape(hiof_sellSignal, "Sell", shape.xcross, location.abovebar, hiof_sigSellColor, size=size.small)
+
+// ───────────────────────────────────────────────────────────────────────────
+// // C11 · SIGNAL ALERTS
+// // ───────────────────────────────────────────────────────────────────────────
+// alertcondition(hiof_buySignal,  "HIOF: Buy Signal",  "HIOF Buy — Bullish OB breakout or retest confirmed")
+// alertcondition(hiof_sellSignal, "HIOF: Sell Signal", "HIOF Sell — Bearish OB breakout or retest confirmed")
