@@ -83,6 +83,7 @@ oiSkipFirst = input.bool(false, "Skip ΔOI on first bar of the day", group=grpOI
 grpOILbl = "Open Interest — Labels"
 oiShowDelta  = input.bool(true, "Show ΔOI", group=grpOILbl)
 oiShowRatio  = input.bool(true, "Show OI-to-Volume ratio", group=grpOILbl)
+oiRatioMode  = input.string("ΔOI ÷ bar volume", "Ratio formula", options=["ΔOI ÷ bar volume", "OI ÷ day volume", "OI ÷ bar volume"], group=grpOILbl, tooltip="ΔOI ÷ bar volume: share of this bar's volume that opened (+) or closed (−) positions. Always between −1 and +1.\nOI ÷ day volume: total open positions vs today's volume so far. Starts high at 09:15 and falls towards ~1 by the close.\nOI ÷ bar volume: total open positions vs one bar's volume. Correct maths, but 50–150 on intraday bars, because OI is the whole market's open stock and one bar's volume is a small slice of the day.")
 oiLayout     = input.string("ΔOI above, ratio below", "Layout", options=["ΔOI above, ratio below", "Both above", "Both below"], group=grpOILbl, tooltip="'Both above/below' merges the two values into one label that uses the ΔOI colour.")
 oiPrefix     = input.bool(false, "Show 'ΔOI' / 'OI/V' prefixes", group=grpOILbl)
 oiUpColor    = input.color(color.rgb(0, 200, 120), "ΔOI increase colour", group=grpOILbl)
@@ -483,20 +484,31 @@ float vQty  = not na(vRaw)  and vRawT  == time ? vRaw  * vMult  : na
 bool  oiFirstOfDay = timeframe.isintraday and timeframe.change("D")
 float dOI = na(oiQty) or na(oiQty[1]) or (oiSkipFirst and oiFirstOfDay) ? na : oiQty - oiQty[1]
 
-// OI-to-Volume: this bar's OI quantity ÷ this bar's volume quantity
-float oiVolRatio = not na(oiQty) and not na(vQty) and vQty > 0 ? oiQty / vQty : na
+// Today's running volume (quantity), for the "OI ÷ day volume" formula
+var float oiDayVol = 0.0
+if oiFirstOfDay or not timeframe.isintraday
+    oiDayVol := 0.0
+if not na(vQty) and f_inSess(time)
+    oiDayVol += vQty
+
+// Ratio (all quantities, so the lot size never enters it unless a unit is set to Contracts)
+float oiVolRatio = switch oiRatioMode
+    "ΔOI ÷ bar volume" => not na(dOI)   and not na(vQty) and vQty > 0     ? dOI / vQty       : na
+    "OI ÷ day volume"  => not na(oiQty) and oiDayVol > 0                  ? oiQty / oiDayVol : na
+    => not na(oiQty) and not na(vQty) and vQty > 0 ? oiQty / vQty : na
 
 // --- Formatting ---
-// K from 1,000 up; M from 1,000,000 up (so 1.2 crore reads 12M, not 12000K). One decimal max, ".0" dropped.
+// Whole numbers only: below 1,000 as is, from 1,000 up in whole K (15,300 -> 15K, 15,600 -> 16K).
 f_fmtSignedK(float v) =>
-    float a    = math.abs(v)
-    float k    = math.round(a / 1000.0, 1)
-    float m    = math.round(a / 1000000.0, 1)
-    string body = math.round(a) < 1000 ? str.tostring(math.round(a)) : k < 1000.0 ? str.tostring(k, "0.#") + "K" : str.tostring(m, "0.#") + "M"
+    float a     = math.abs(v)
+    string body = math.round(a) < 1000 ? str.tostring(math.round(a)) : str.tostring(math.round(a / 1000.0)) + "K"
     string sgn  = body == "0" ? "" : v > 0 ? "+" : "-"
     sgn + body
 
-f_fmtRatio(float r) => r < 0.05 ? "<0.1x" : str.tostring(math.round(r, 1), "0.#") + "x"
+// One decimal at most, no "x". Signed (ΔOI ÷ volume can be negative); a value that rounds to 0 shows "0".
+f_fmtRatio(float r) =>
+    string body = str.tostring(math.abs(math.round(r, 1)), "0.#")
+    (body != "0" and r < 0 ? "-" : "") + body
 
 f_oiLabel(bool above, string txt, color col, string sz) =>
     label.new(bar_index, above ? high : low, txt, yloc=above ? yloc.abovebar : yloc.belowbar, style=above ? label.style_label_down : label.style_label_up, color=oiBgColor, textcolor=col, size=f_size(sz))
