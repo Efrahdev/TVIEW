@@ -1,0 +1,784 @@
+//@version=6
+indicator("NF 1.4", "NF", overlay=false, max_labels_count=500, max_boxes_count=60)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NF 1.4 — NF 1.3 + volume histogram in the bottom pane, ΔOI label on top of each volume bar
+// NF 1.3 — NF 1.2 + OI build-up price zones (shaded bands on the price chart)
+// NF 1.2 — NF 1.1 with the bottom-pane ΔOI row pinned to the pane bottom
+// NF 1.1 — built on NF 1.0 (= v2.3)
+//   · One script, two panes: the script sits in its own bottom pane (per-candle ΔOI
+//     values) and draws everything price-related on the main chart with force_overlay.
+//   · Status line: whole numbers only; adds the day's cumulative ΔOI (09:15–15:30).
+//   · Volume labels anchored in pixels (yloc.abovebar/belowbar) so they never sit on
+//     the candle body at any zoom.
+//   Kept:    Child Contribution engine (identical to v1.1 incl. FIX 2.1–2.3),
+//            Session VWAP, Previous-Day High/Low, Previous-Day VWAP (toggle, off).
+//   Removed: HVMV, HIOF (order blocks, FVGs, BOS, pivots, sweeps, signals),
+//            day-regime shading, volume-anomaly candles, Clean Chart mode,
+//            and inputs that were never read.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+useSession = input.bool(true, "Filter to NSE 09:15-15:30", display=display.none)
+
+grpContainer = "Container Timeframe (For Child Contribution)"
+containerTF = input.timeframe("5", "Container Timeframe", group=grpContainer, tooltip="The timeframe that 'contains' child bars. Child contribution is ALWAYS calculated relative to this timeframe's bar volume, regardless of chart timeframe.", display=display.none)
+
+grpChild = "Child Timeframe Settings"
+ltfChild = input.timeframe("1", "Child Timeframe", group=grpChild, tooltip="Use 1S for true volume footprint from your data provider. Must be lower than Container Timeframe.", display=display.none)
+// FIX 2.1 / 2.3 — data-quality gate: skip containers with missing child bars
+requireComplete = input.bool(true, "Require Complete Containers", group=grpChild, tooltip="Score a container only when every child bar is present (e.g. all 5 one-minute bars of a 5m container). Containers with missing child bars are skipped instead of showing an inflated share. The session's last, shorter container (e.g. 15:15 on 30m/60m) is judged against the minutes it actually covers.", display=display.none)
+
+grpBaseline = "Adaptive Baseline"
+baselineLookback = input.int(1000, "Baseline Lookback (Container bars)", minval=20, maxval=2000, group=grpBaseline, display=display.none)
+volumeLookback = input.int(1000, "Volume Lookback (Container bars)", minval=50, maxval=2000, group=grpBaseline, display=display.none)
+
+grpStaticTiers = "Static Tier Thresholds (When Dynamic OFF)"
+staticT1Input = input.float(50.0, "Static Tier 1 Threshold %", minval=1, maxval=100, step=5, group=grpStaticTiers, tooltip="Minimum exceedance % for Tier 1 (circle plot)", display=display.none)
+staticT2Input = input.float(75.0, "Static Tier 2 Threshold %", minval=5, maxval=150, step=5, group=grpStaticTiers, tooltip="Minimum exceedance % for Tier 2 (marker + volume label)", display=display.none)
+staticT3Input = input.float(100.0, "Static Tier 3 Threshold %", minval=20, maxval=300, step=10, group=grpStaticTiers, tooltip="Minimum exceedance % for Tier 3 (extreme marker)", display=display.none)
+
+grpDynamicTiers = "Dynamic Tier Thresholds (Percentile-Based)"
+useDynamicTiers = input.bool(false, "Use Dynamic Tier Thresholds", group=grpDynamicTiers, tooltip="When enabled, tier color thresholds are calculated dynamically based on historical exceedance percentiles.", display=display.none)
+tier1Percentile = input.float(50.0, "Tier 1 Percentile (Common)", minval=10, maxval=200, step=5, group=grpDynamicTiers, display=display.none)
+tier2Percentile = input.float(80.0, "Tier 2 Percentile (Medium)", minval=40, maxval=200, step=5, group=grpDynamicTiers, display=display.none)
+tier3Percentile = input.float(99.0, "Tier 3 Percentile (Extreme/Rare)", minval=70, maxval=200, step=1, group=grpDynamicTiers, display=display.none)
+exceedanceLookback = input.int(500, "Exceedance History Lookback", minval=100, maxval=5000, group=grpDynamicTiers, display=display.none)
+minHistoryForDynamic = input.int(500, "Min History for Dynamic", minval=20, maxval=2000, group=grpDynamicTiers, display=display.none)
+
+grpVisual = "Visualization"
+showMarkers = input.bool(true, "Show Volume Contribution Markers", group=grpVisual, display=display.none)
+showVolValue = input.bool(true, "Show Volume Value Label", group=grpVisual, display=display.none)
+showExcPct   = input.bool(true, "Show Exceedance % Label", group=grpVisual, display=display.none)
+volumeLabelSizeInput = input.string("small", "Volume Label Size", options=["tiny", "small", "normal", "large", "huge"], group=grpVisual, display=display.none)
+minVolumePctOfAvg = input.float(10.0, "Min Volume % of Avg", minval=10, maxval=100, step=5, group=grpVisual, display=display.none)
+bool showAnyVolLabel = showVolValue or showExcPct
+
+grpMarkerExceedance = "Volume Marker Exceedance Settings"
+markerExceedanceSizeInput = input.string("normal", "Volume Marker Size", options=["tiny", "small", "normal"], group=grpMarkerExceedance, display=display.none)
+
+grpColors = "Tier Colors (Baseline Exceedance)"
+colorTier1 = input.color(color.rgb(246, 247, 249), "Tier 1: Common", group=grpColors, display=display.none)
+colorTier2 = input.color(color.rgb(91, 252, 104), "Tier 2: Medium", group=grpColors, display=display.none)
+colorTier3 = input.color(color.rgb(139, 170, 255), "Tier 3: Extreme/Rare", group=grpColors, display=display.none)
+
+grpVWAP = "Session VWAP"
+showSessVWAP = input.bool(true, "Show Session VWAP", group=grpVWAP, display=display.none)
+sessVWAPColor = input.color(color.rgb(101, 94, 73), "Session VWAP Color", group=grpVWAP, display=display.none)
+sessVWAPTrans = input.int(20, "Session VWAP Transparency", minval=0, maxval=100, group=grpVWAP, display=display.none)
+
+grpDay = "Previous Day Levels"
+showDayHL = input.bool(true, "Show Previous Day High/Low", group=grpDay, display=display.none)
+showPrevDayVWAP = input.bool(false, "Show Previous Day VWAP", group=grpDay, display=display.none)
+dayHighColor = input.color(color.rgb(3, 121, 109, 50), "Day High Color", group=grpDay, display=display.none)
+dayLowColor = input.color(color.rgb(156, 39, 31, 80), "Day Low Color", group=grpDay, display=display.none)
+dayVWAPColor = input.color(color.rgb(89, 86, 35, 70), "Previous Day VWAP Color", group=grpDay, display=display.none)
+dayLineWidth = input.int(1, "Line Width", minval=1, maxval=4, group=grpDay, display=display.none)
+
+grpOI = "Open Interest — Data"
+oiUseChart  = input.bool(true, "Use chart symbol for OI & volume", group=grpOI, tooltip="On: OI and volume come from the chart's own symbol (e.g. NSE:NIFTY1!). Off: they come from the symbol below, so the OI features also work on the NIFTY spot chart, which has no OI or volume.", display=display.none)
+oiSymbol    = input.symbol("NSE:NIFTY1!", "OI source symbol (when not using chart)", group=grpOI, display=display.none)
+oiUnit      = input.string("Quantity", "OI data unit", options=["Quantity", "Contracts"], group=grpOI, tooltip="TradingView's NSE futures feed normally reports quantity. Sanity check with the 'Total OI' status-line value: NIFTY futures OI is around 1–2 crore units in quantity; if the raw number is only in lakhs or thousands, the feed is in contracts.", display=display.none)
+volUnit     = input.string("Quantity", "Volume data unit", options=["Quantity", "Contracts"], group=grpOI, tooltip="Set independently of OI. If OI and volume use different units, the ratio is wrong by the lot size unless both are set correctly here.", display=display.none)
+lotSize     = input.int(65, "NIFTY quantity per lot", minval=1, group=grpOI, tooltip="Used only for a series set to 'Contracts'. Verify against the current NSE circular. A single fixed lot size cannot convert older bars correctly if the lot size changed since then.", display=display.none)
+oiSkipFirst = input.bool(false, "Skip ΔOI on first bar of the day", group=grpOI, tooltip="The first bar's ΔOI is the overnight change (previous day's last bar to today's first bar). On a continuous contract (NIFTY1!) the roll day also swaps contracts, which creates one huge fake ΔOI. Turn this on to hide the first-bar value.", display=display.none)
+
+
+grpOIB = "Open Interest — Benchmark"
+oiMeasure   = input.string("OI added (ΔOI > 0)", "Benchmark compares", options=["OI added (ΔOI > 0)", "Size of OI change (|ΔOI|)", "Total OI level"], group=grpOIB, tooltip="OI added: bars whose ΔOI is positive, compared with the history of positive-ΔOI bars.\nSize of OI change: |ΔOI| of every bar, adds and drops alike.\nTotal OI level: the bar's total OI. OI builds up through the expiry cycle, so this flags long runs of bars late in the series rather than single unusual candles.", display=display.none)
+oiRefMethod = input.string("Average of mean and median", "Reference level", options=["Average of mean and median", "Range: above both mean and median", "Range: above either mean or median"], group=grpOIB, tooltip="Not finalised, so it is a setting.\nAverage: reference = (mean + median) / 2.\nAbove both: reference = the higher of the two (the upper edge of the range). This is the rule the volume markers already use.\nAbove either: reference = the lower of the two (the lower edge of the range). Flags the most bars.", display=display.none)
+oiBenchLen  = input.int(1000, "History length (bars)", minval=20, maxval=5000, group=grpOIB, tooltip="Number of past qualifying, closed, in-session bars used for the mean and median. The current bar is never part of its own benchmark.", display=display.none)
+oiMinHist   = input.int(50, "Min history before flagging", minval=10, maxval=2000, group=grpOIB, display=display.none)
+oiShowAccent= input.bool(true, "Accent candle bodies above the reference", group=grpOIB, display=display.none)
+oiBullAccent= input.color(color.rgb(0, 230, 118), "Green candle accent", group=grpOIB, display=display.none)
+oiBearAccent= input.color(color.rgb(255, 82, 82), "Red candle accent", group=grpOIB, display=display.none)
+oiAccentTr  = input.int(0, "Accent transparency", minval=0, maxval=90, group=grpOIB, display=display.none)
+oiDeltaPlain = input.bool(false, "ΔOI in status line as plain thousands", group=grpOIB, tooltip="Off: ΔOI shows as 12K, 100K, -5K. TradingView switches to M at 10 lakh (1M) and above. On: ΔOI is shown in thousands as a plain whole number (12, 100, 1112). It never turns into M, but the status line cannot print the letter K after it.", display=display.none)
+grpVolPane = "Bottom pane — Volume + ΔOI"
+volUpCol     = input.color(color.rgb(38, 166, 154), "Volume up colour", group=grpVolPane, display=display.none)
+volDnCol     = input.color(color.rgb(239, 83, 80), "Volume down colour", group=grpVolPane, display=display.none)
+volTr        = input.int(50, "Volume transparency", minval=0, maxval=90, group=grpVolPane, display=display.none)
+volHeadroom  = input.int(35, "Space above bars for labels (%)", minval=0, maxval=200, group=grpVolPane, tooltip="Keeps room at the top of the pane so the ΔOI label on the tallest volume bar is never cut off.", display=display.none)
+oiAutoThin   = input.bool(true, "Auto-thin ΔOI labels when zoomed out", group=grpVolPane, tooltip="When more bars are on screen than labels can fit, bars are grouped and only the bar with the largest |ΔOI| in each group keeps its label. Zoom in and every bar gets its label again.", display=display.none)
+oiMaxAcross  = input.int(40, "Max ΔOI labels across the screen", minval=10, maxval=200, group=grpVolPane, display=display.none)
+oiPaneSize   = input.string("tiny", "ΔOI label text size", options=["tiny", "small", "normal", "large"], group=grpVolPane, display=display.none)
+grpZ = "OI Zones — where +ΔOI was added"
+zShow      = input.bool(true, "Show OI zones", group=grpZ, display=display.none)
+zBin       = input.float(10.0, "Bin size (points)", minval=1.0, step=1.0, group=grpZ, tooltip="Price is cut into horizontal slices of this height. Each slice collects the positive ΔOI estimated to have been added inside it.", display=display.none)
+zDays      = input.int(1, "Previous days to include (plus today)", minval=0, maxval=10, group=grpZ, tooltip="1 = today + the previous trading day. 0 = today only.", display=display.none)
+zTopN      = input.int(8, "Shade the top N bins", minval=1, maxval=50, group=grpZ, display=display.none)
+zNarrowMode= input.string("ATR multiple", "Narrow bar is defined by", options=["ATR multiple", "Points"], group=grpZ, tooltip="Narrow bar: its +ΔOI is spread evenly over the candle's low-to-high range. Other bars: +ΔOI is split across the 1-minute candles inside it by their share of volume, at each 1-minute candle's VWAP (estimated).", display=display.none)
+zNarrowAtr = input.float(0.5, "Narrow if range ≤ ATR ×", minval=0.05, step=0.05, group=grpZ, display=display.none)
+zAtrLen    = input.int(14, "ATR length", minval=1, group=grpZ, display=display.none)
+zNarrowPts = input.float(12.0, "Narrow if range ≤ points", minval=0.5, step=0.5, group=grpZ, display=display.none)
+zSplit     = input.bool(true, "Colour by build-up type", group=grpZ, tooltip="On: green = long build-up (price up, OI up), red = short build-up (price down, OI up), decided by which type added more OI in that bin. Off: one colour.", display=display.none)
+zLongCol   = input.color(color.rgb(0, 200, 120), "Long build-up colour", group=grpZ, display=display.none)
+zShortCol  = input.color(color.rgb(255, 82, 82), "Short build-up colour", group=grpZ, display=display.none)
+zOneCol    = input.color(color.rgb(66, 165, 245), "Single colour", group=grpZ, display=display.none)
+zTrStrong  = input.int(65, "Transparency, strongest bin", minval=0, maxval=95, group=grpZ, display=display.none)
+zTrWeak    = input.int(88, "Transparency, weakest shaded bin", minval=0, maxval=98, group=grpZ, display=display.none)
+zShowText  = input.bool(true, "Show +ΔOI amount in each zone", group=grpZ, display=display.none)
+oiShowReadout = input.bool(false, "Show exact readout table (last bar)", group=grpOIB, tooltip="The status line cannot print custom text such as Indian comma grouping (1,11,200K). This small table shows the latest bar's values with exact formatting.", display=display.none)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODE DETECTION — DUAL ARCHITECTURE
+// ═══════════════════════════════════════════════════════════════════════════
+int _chartSec  = timeframe.in_seconds()
+int _contSec   = timeframe.in_seconds(containerTF)
+
+bool isMarkerLTF     = _chartSec < _contSec
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+var int SESS_START_MINS = 9 * 60 + 15
+var int SESS_END_MINS   = 15 * 60 + 30
+
+f_size(string s) => s == "tiny" ? size.tiny : s == "small" ? size.small : s == "large" ? size.large : s == "huge" ? size.huge : size.normal
+var volLabelSize = f_size(volumeLabelSizeInput)
+var markerExcSize = f_size(markerExceedanceSizeInput)
+
+f_inSess(int ts) => not useSession or (hour(ts) * 60 + minute(ts) >= SESS_START_MINS and hour(ts) * 60 + minute(ts) <= SESS_END_MINS)
+
+// FIX 2.1 / 2.3 — how many child bars a complete container should hold (session-aware)
+f_expChildren(int contStartT) =>
+    float childMin = timeframe.in_seconds(ltfChild) / 60.0
+    float contMinF = timeframe.in_seconds(containerTF) / 60.0
+    int   startM   = hour(contStartT) * 60 + minute(contStartT)
+    float spanMin  = useSession ? math.min(contMinF, SESS_END_MINS - startM) : contMinF
+    int(math.max(1, math.floor(spanMin / childMin)))
+
+f_poc(float o, float h, float l, float c) =>
+    float rng = h - l
+    if rng == 0.0
+        c
+    else
+        float br = math.abs(c - o) / rng
+        float poc = br >= 0.60 ? (c >= o ? (l + o) * 0.5 : (h + o) * 0.5) : br >= 0.30 ? (o + c) * 0.5 : (h + l) * 0.5
+        math.max(l, math.min(h, poc + 0.10 * ((math.min(o, c) - l) - (h - math.max(o, c)))))
+
+f_fmtVol(float v) => na(v) ? "" : v >= 1000000 ? str.tostring(math.ceil(v / 1000000)) + "M" : v >= 1000 ? str.tostring(math.ceil(v / 1000)) + "K" : str.tostring(math.ceil(v))
+
+// --- Volume label builder: respects split checkboxes ---
+f_buildVolLabel(float vol, float contrib) =>
+    string _v = showVolValue  ? f_fmtVol(vol) : ""
+    string _p = showExcPct    ? str.tostring(math.round(contrib)) + "%" : ""
+    string _sep = showVolValue and showExcPct ? "\n" : ""
+    _v + _sep + _p
+
+// --- Volume label: anchored in PIXELS just above the bar (green candle) or below it (red candle).
+//     yloc.abovebar/belowbar + label_down/label_up means the text grows AWAY from the candle,
+//     so it never sits on the body or wick, whatever the zoom or price scale. ---
+f_volLabel(int x, bool isBull, string txt, color col) =>
+    label.new(x, isBull ? high : low, txt, yloc=isBull ? yloc.abovebar : yloc.belowbar, style=isBull ? label.style_label_down : label.style_label_up, color=color.new(color.black, 100), textcolor=col, size=volLabelSize, force_overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA REQUESTS — All unconditional (Pine requires global-scope requests)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Marker pipeline ---
+string _safeContTF = isMarkerLTF ? ltfChild : containerTF
+[cO, cH, cL, cC, cV, cT] = request.security_lower_tf(syminfo.tickerid, _safeContTF, [open, high, low, close, volume, time])
+[chO, chH, chL, chC, chV, chT] = request.security_lower_tf(syminfo.tickerid, ltfChild, [open, high, low, close, volume, time])
+// FIX 2.2 — removed: float htfContVol = request.security(..., containerTF, volume, ..., barmerge.lookahead_on)
+//           (on history it leaked the finished container's volume into its first child bar)
+
+// --- Previous-day levels (high[1]/low[1] + lookahead_on = settled values, no repaint) ---
+[prevD1H, prevD1L] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT STATE
+// ═══════════════════════════════════════════════════════════════════════════
+var array<float> pctHist  = array.new_float()
+var array<float> volHist  = array.new_float()
+var array<float> excHist  = array.new_float()
+var float baseMean = na
+var float baseMed  = na
+var float avgVol   = na
+var float dynT1 = staticT1Input
+var float dynT2 = staticT2Input
+var float dynT3 = staticT3Input
+var int lastProcTime = 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKER PROCESSING — HTF MODE (chart >= container)
+// Anti-spill: only keep the BEST qualifying container per chart bar
+// ═══════════════════════════════════════════════════════════════════════════
+int contDurMs = timeframe.in_seconds(containerTF) * 1000
+float barVol       = 0.0
+float htf_bestVol  = 0.0
+float htf_bestPOC  = na
+float htf_bestContrib = na
+
+if not isMarkerLTF
+    int numC  = array.size(cV)
+    int numCh = array.size(chV)
+    if numC > 0
+        for i = 0 to numC - 1
+            int ct  = array.get(cT, i)
+            float cv = array.get(cV, i)
+            if f_inSess(ct) and cv > 0
+                barVol += cv
+                int cEnd = ct + contDurMs
+                float mxV = 0.0
+                float mxPOC = na
+                float sumCh = 0.0   // FIX 2.3 — this container's own child-volume total
+                int   cntCh = 0     // FIX 2.1 — how many child bars actually arrived
+                if numCh > 0
+                    for j = 0 to numCh - 1
+                        int cht = array.get(chT, j)
+                        if cht >= ct and cht < cEnd and f_inSess(cht)
+                            float chvol = nz(array.get(chV, j))
+                            sumCh += chvol
+                            cntCh += 1
+                            if chvol > mxV
+                                mxV := chvol
+                                mxPOC := f_poc(array.get(chO, j), array.get(chH, j), array.get(chL, j), array.get(chC, j))
+                // FIX 2.3 — denominator is the sum of the children, not the container feed's volume
+                float contrib = sumCh > 0 and mxV > 0 ? mxV / sumCh * 100.0 : na
+                // FIX 2.1 — only a closed chart bar with a complete container is scored
+                bool complete = not requireComplete or cntCh >= f_expChildren(ct)
+                if barstate.isconfirmed and complete
+                    if mxV > htf_bestVol
+                        htf_bestVol    := mxV
+                        htf_bestPOC    := mxPOC
+                        htf_bestContrib := contrib
+                    if ct > lastProcTime
+                        if not na(contrib)
+                            array.push(pctHist, contrib)
+                            if array.size(pctHist) > baselineLookback
+                                array.shift(pctHist)
+                        if mxV > 0
+                            array.push(volHist, mxV)
+                            if array.size(volHist) > volumeLookback
+                                array.shift(volHist)
+                        lastProcTime := math.max(lastProcTime, ct)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARKER PROCESSING — LTF MODE (chart < container)
+// ═══════════════════════════════════════════════════════════════════════════
+int _markerContChange = ta.change(time(containerTF))
+bool newMarkerCont = isMarkerLTF and _markerContChange != 0
+// FIX 2.2 — the container is finished on its last chart bar (or the session's last bar)
+bool ltfContEnd = isMarkerLTF and barstate.isconfirmed and (time_close == time_close(containerTF) or session.islastbar_regular)
+
+var float ltf_bestVol    = 0.0
+var float ltf_bestPOC    = na
+var float ltf_bestContrib = na
+var int   ltf_bestBarIdx  = 0
+var label ltf_markerLbl   = na
+var label ltf_volLbl      = na
+var int   ltf_labeledTier = 0
+var float ltf_contSum     = 0.0   // FIX 2.2 / 2.3 — running child-volume sum for this container
+var int   ltf_childCnt    = 0     // FIX 2.2 — child bars seen in this container
+var int   ltf_contStartT  = na    // FIX 2.2 — container open time (for the completeness check)
+
+if isMarkerLTF
+    if newMarkerCont
+        if barstate.isconfirmed or bar_index > 0
+            // FIX 2.2 — only containers that were finalised at their close enter the history
+            if not na(ltf_bestContrib) and ltf_bestContrib > 0
+                array.push(pctHist, ltf_bestContrib)
+                if array.size(pctHist) > baselineLookback
+                    array.shift(pctHist)
+                if ltf_bestVol > 0
+                    array.push(volHist, ltf_bestVol)
+                    if array.size(volHist) > volumeLookback
+                        array.shift(volHist)
+        ltf_bestVol     := 0.0
+        ltf_bestPOC     := na
+        ltf_bestContrib := na
+        ltf_bestBarIdx  := bar_index
+        ltf_markerLbl   := na
+        ltf_volLbl      := na
+        ltf_labeledTier := 0
+        ltf_contSum     := 0.0
+        ltf_childCnt    := 0
+        ltf_contStartT  := time(containerTF)
+
+    int nCh = array.size(chV)
+    if nCh > 0
+        for j = 0 to nCh - 1
+            if f_inSess(array.get(chT, j))
+                float chvol = nz(array.get(chV, j))
+                ltf_contSum  += chvol
+                ltf_childCnt += 1
+                if chvol > ltf_bestVol
+                    ltf_bestVol    := chvol
+                    ltf_bestPOC    := f_poc(array.get(chO, j), array.get(chH, j), array.get(chL, j), array.get(chC, j))
+                    ltf_bestBarIdx := bar_index
+    // FIX 2.2 / 2.3 — the share is only known once the container has closed:
+    //                 biggest child / sum of ALL its children (no partial denominator, no lookahead)
+    if ltfContEnd and ltf_bestVol > 0 and ltf_contSum > 0
+        int expCh = f_expChildren(na(ltf_contStartT) ? time(containerTF) : ltf_contStartT)
+        if not requireComplete or ltf_childCnt >= expCh
+            ltf_bestContrib := ltf_bestVol / ltf_contSum * 100.0
+    barVol := ltf_contSum
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MERGE — Marker unified output regardless of mode
+// ═══════════════════════════════════════════════════════════════════════════
+float maxChildVol  = isMarkerLTF ? ltf_bestVol     : htf_bestVol
+float maxChildPOC  = isMarkerLTF ? ltf_bestPOC     : htf_bestPOC
+float maxContrib   = isMarkerLTF ? ltf_bestContrib : htf_bestContrib
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BASELINE CALCULATIONS — Markers
+// ═══════════════════════════════════════════════════════════════════════════
+int pSz = array.size(pctHist)
+if pSz >= 10
+    baseMean := array.avg(pctHist)
+    baseMed  := array.percentile_linear_interpolation(pctHist, 50)
+int vSz = array.size(volHist)
+if vSz >= 20
+    avgVol := array.avg(volHist)
+
+float baseline    = math.max(nz(baseMean), nz(baseMed))
+bool exceedsBase  = not na(maxContrib) and maxContrib > nz(baseMean) and maxContrib > nz(baseMed)
+float excPct      = baseline > 0 and not na(maxContrib) ? (maxContrib - baseline) / baseline * 100.0 : na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXCEEDANCE HISTORY + DYNAMIC TIERS
+// ═══════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed and not na(excPct) and excPct > 0
+    array.push(excHist, excPct)
+    if array.size(excHist) > exceedanceLookback
+        array.shift(excHist)
+
+int eSz = array.size(excHist)
+bool dynActive = useDynamicTiers and eSz >= minHistoryForDynamic
+if dynActive
+    float t1v = array.percentile_linear_interpolation(excHist, tier1Percentile)
+    float t2v = array.percentile_linear_interpolation(excHist, tier2Percentile)
+    float t3v = array.percentile_linear_interpolation(excHist, tier3Percentile)
+    dynT1 := math.max(1.0, nz(t1v, staticT1Input))
+    dynT2 := math.max(dynT1 + 0.1, nz(t2v, staticT2Input))
+    dynT3 := math.max(dynT2 + 0.1, nz(t3v, staticT3Input))
+
+float actT1 = dynActive ? dynT1 : staticT1Input
+float actT2 = dynActive ? dynT2 : staticT2Input
+float actT3 = dynActive ? dynT3 : staticT3Input
+
+float volThresh = nz(avgVol) * minVolumePctOfAvg / 100.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIER QUALIFICATION
+// ═══════════════════════════════════════════════════════════════════════════
+bool meetsVol      = maxChildVol >= volThresh
+bool tier1Qualifies = exceedsBase and not na(excPct) and excPct >= actT1 and meetsVol and not na(maxChildPOC)
+bool tier2Qualifies = exceedsBase and not na(excPct) and excPct >= actT2 and meetsVol and not na(maxChildPOC)
+bool tier3Qualifies = exceedsBase and not na(excPct) and excPct >= actT3 and meetsVol and not na(maxChildPOC)
+int currentTier = tier3Qualifies ? 3 : tier2Qualifies ? 2 : tier1Qualifies ? 1 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION — HTF MODE (chart >= container)
+// ═══════════════════════════════════════════════════════════════════════════
+float tier1POC = na
+
+// FIX 2.1 — draw only on confirmed bars (the "●" marker was previously drawn on the live bar)
+if not isMarkerLTF and barstate.isconfirmed
+    if tier1Qualifies and not tier2Qualifies
+        tier1POC := maxChildPOC
+        if showAnyVolLabel and barstate.isconfirmed
+            f_volLabel(bar_index, close >= open, f_buildVolLabel(maxChildVol, maxContrib), colorTier1)
+    if tier2Qualifies
+        if showMarkers
+            color tCol = tier3Qualifies ? colorTier3 : colorTier2
+            label.new(bar_index, maxChildPOC, "●", style=label.style_none, textcolor=tCol, size=markerExcSize, force_overlay=true)
+            if showAnyVolLabel and barstate.isconfirmed
+                f_volLabel(bar_index, close >= open, f_buildVolLabel(maxChildVol, maxContrib), tCol)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION — LTF MODE (chart < container)
+// ═══════════════════════════════════════════════════════════════════════════
+if isMarkerLTF
+    bool tierChanged = currentTier != ltf_labeledTier
+    bool barChanged  = ltf_bestBarIdx != (ltf_labeledTier != 0 ? ltf_bestBarIdx : -1)
+    bool needsRedraw = (currentTier > 0 and (tierChanged or ltf_labeledTier == 0)) or (currentTier == 0 and ltf_labeledTier > 0)
+
+    if not na(ltf_markerLbl)
+        int prevLblBar = label.get_x(ltf_markerLbl)
+        if prevLblBar != ltf_bestBarIdx
+            needsRedraw := true
+
+    if needsRedraw or newMarkerCont
+        if not na(ltf_markerLbl)
+            label.delete(ltf_markerLbl)
+            ltf_markerLbl := na
+        if not na(ltf_volLbl)
+            label.delete(ltf_volLbl)
+            ltf_volLbl := na
+        ltf_labeledTier := 0
+
+    if currentTier > 0 and not na(ltf_bestPOC) and (needsRedraw or newMarkerCont or ltf_labeledTier == 0)
+        color tCol = currentTier >= 3 ? colorTier3 : currentTier >= 2 ? colorTier2 : colorTier1
+        int tgtBar = ltf_bestBarIdx
+        int offset = bar_index - tgtBar
+        float tgtOpen  = offset >= 0 and offset < 5000 ? open[offset]  : open
+        float tgtClose = offset >= 0 and offset < 5000 ? close[offset] : close
+        bool  tgtBull  = tgtClose >= tgtOpen
+
+        if showMarkers
+            ltf_markerLbl := label.new(tgtBar, ltf_bestPOC, "●", style=label.style_none, textcolor=tCol, size=currentTier >= 2 ? markerExcSize : size.small, force_overlay=true)
+        if showAnyVolLabel
+            ltf_volLbl := f_volLabel(tgtBar, tgtBull, f_buildVolLabel(ltf_bestVol, ltf_bestContrib), tCol)
+        ltf_labeledTier := currentTier
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(showMarkers and not isMarkerLTF ? tier1POC : na, "Tier1 POC", colorTier1, 2, plot.style_circles, display=display.pane, force_overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION VWAP
+// ═══════════════════════════════════════════════════════════════════════════
+bool inSess  = f_inSess(time)
+bool newSess = inSess and (not f_inSess(time[1]) or dayofmonth != dayofmonth[1])
+var float vwPV = 0.0
+var float vwV  = 0.0
+var float prevDayVWAPCalc = na
+
+if newSess
+    if vwV > 0
+        prevDayVWAPCalc := vwPV / vwV
+    vwPV := 0.0
+    vwV  := 0.0
+if inSess
+    vwPV += hlc3 * volume
+    vwV  += volume
+float currentVWAP = vwV > 0 ? vwPV / vwV : na
+bool isLatestTradingDay = year(time) == year(last_bar_time) and month(time) == month(last_bar_time) and dayofmonth(time) == dayofmonth(last_bar_time)
+
+plot(showSessVWAP and inSess and isLatestTradingDay ? currentVWAP : na, "VWAP", color.new(sessVWAPColor, sessVWAPTrans), 1, plot.style_line, linestyle=plot.linestyle_dashed, display=display.pane, force_overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PREVIOUS DAY LEVELS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(showDayHL ? prevD1H : na, "PDH", color.new(dayHighColor, 70), dayLineWidth, plot.style_stepline, display=display.pane, force_overlay=true)
+plot(showDayHL ? prevD1L : na, "PDL", color.new(dayLowColor, 70), dayLineWidth, plot.style_stepline, display=display.pane, force_overlay=true)
+plot(showPrevDayVWAP ? prevDayVWAPCalc : na, "PDV", color.new(dayVWAPColor, 50), dayLineWidth, plot.style_stepline, linestyle=plot.linestyle_dashed, display=display.pane, force_overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OPEN INTEREST — data, ΔOI, benchmark, body accent
+//   · Both series are requested on the CHART timeframe with lookahead OFF:
+//     a historical bar sees only that bar's own closing OI and volume.
+//   · The requested bar's time must equal the chart bar's time. With gaps_off,
+//     a missing OI/volume bar would silently repeat the previous bar's value
+//     (fake ΔOI = 0). Those bars are treated as missing instead.
+//   · Symbols are built from prefix:ticker, so Heikin Ashi / Renko chart types
+//     cannot leak synthetic prices or volumes into the request.
+//   · Benchmark: compare THEN update, closed bars only. The current bar is
+//     judged against history that does not contain itself, and the live bar
+//     is never flagged until it closes. History and live therefore match.
+// ═══════════════════════════════════════════════════════════════════════════
+string oiSrc = oiUseChart ? syminfo.prefix + ":" + syminfo.ticker : oiSymbol
+[oiRaw, oiRawT] = request.security(oiSrc + "_OI", timeframe.period, [close, time], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[vRaw, vRawT]   = request.security(oiSrc, timeframe.period, [volume, time], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+float oiMult = oiUnit  == "Contracts" ? lotSize : 1.0
+float vMult  = volUnit == "Contracts" ? lotSize : 1.0
+
+// Only accept values that belong to THIS chart bar
+float oiQty = not na(oiRaw) and oiRawT == time ? oiRaw * oiMult : na
+float vQty  = not na(vRaw)  and vRawT  == time ? vRaw  * vMult  : na
+
+// ΔOI: current bar OI − immediately preceding chart bar OI (na if either is missing)
+bool  oiFirstOfDay = timeframe.isintraday and timeframe.change("D")
+float dOI = na(oiQty) or na(oiQty[1]) or (oiSkipFirst and oiFirstOfDay) ? na : oiQty - oiQty[1]
+
+// ΔOI as a % of this bar's volume (both in quantity, so lot size cancels)
+float dOIPct = not na(dOI) and not na(vQty) and vQty > 0 ? dOI / vQty * 100.0 : na
+
+// --- Benchmark measure for this bar ---
+float oiMeas = switch oiMeasure
+    "OI added (ΔOI > 0)"        => not na(dOI) and dOI > 0 ? dOI : na
+    "Size of OI change (|ΔOI|)" => not na(dOI) ? math.abs(dOI) : na
+    => oiQty
+
+var array<float> oiHist = array.new_float()
+float oiMean = na
+float oiMed  = na
+float oiRef  = na
+bool  oiFlag = false
+bool  oiEval = barstate.isconfirmed and f_inSess(time) and not na(oiMeas)
+
+if oiEval
+    // 1) compare against PRIOR history only
+    if array.size(oiHist) >= oiMinHist
+        oiMean := array.avg(oiHist)
+        oiMed  := array.percentile_linear_interpolation(oiHist, 50)
+        oiRef  := switch oiRefMethod
+            "Average of mean and median"        => (oiMean + oiMed) / 2.0
+            "Range: above both mean and median" => math.max(oiMean, oiMed)
+            => math.min(oiMean, oiMed)
+        oiFlag := oiMeas > oiRef     // strictly above, no tolerance: even 1 unit above is flagged
+    // 2) then add this closed bar to the history
+    array.push(oiHist, oiMeas)
+    if array.size(oiHist) > oiBenchLen
+        array.shift(oiHist)
+
+// --- Body-only accent: border around the body, wick fully transparent ---
+bool  oiAccent  = oiShowAccent and oiFlag
+color oiAccCol  = close >= open ? color.new(oiBullAccent, oiAccentTr) : color.new(oiBearAccent, oiAccentTr)
+color oiClear   = color.new(color.black, 100)
+plotcandle(oiAccent ? open : na, oiAccent ? math.max(open, close) : na, oiAccent ? math.min(open, close) : na, oiAccent ? close : na, "OI Body Accent", color=oiClear, wickcolor=oiClear, bordercolor=oiAccCol, display=display.pane, force_overlay=true)
+
+// --- Missing-data warning (OI ticker invalid or empty for this symbol) ---
+var bool oiSeen = false
+if not na(oiRaw)
+    oiSeen := true
+var table oiWarn = table.new(position.bottom_right, 1, 1, force_overlay=true)
+if barstate.islast and not oiSeen
+    table.cell(oiWarn, 0, 0, "No OI data for " + oiSrc + "_OI. Use a futures symbol such as NSE:NIFTY1!.", text_color=color.white, bgcolor=color.new(color.red, 30), text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATUS LINE — six values, in this order, all whole numbers:
+//   1 Child Vol  2 Bar Vol  3 OI Qty  4 ΔOI  5 ΔOI / Bar Vol %  6 Day Cum ΔOI
+//   All inputs use display=display.none so no setting values appear there.
+//   format.volume prints K/M with decimals (e.g. 23.45K), so each value is first
+//   rounded to a whole K or whole M; the status line then shows 23K, 15M, -18K.
+// ═══════════════════════════════════════════════════════════════════════════
+color C_DOI_UP = #39FF14    // fluorescent green
+color C_DOI_DN = #FF1744    // bright red
+
+f_slWhole(float v) =>
+    float a = math.abs(v)
+    float r = a < 1000.0 ? math.round(v) : a < 1000000.0 ? math.round(v / 1000.0) * 1000.0 : math.round(v / 1000000.0) * 1000000.0
+    not na(v) ? r : na
+
+// --- Day cumulative ΔOI, NSE regular session only (09:15–15:30, fixed, not tied to the session filter) ---
+//   = this bar's OI − OI at the end of the previous trading day (the last OI value before today's
+//     09:15 bar). Using the OI level instead of summing bar ΔOIs means a missing OI minute cannot
+//     drop part of the change. Reset at every new trading day: nothing carries over.
+//   With "Skip ΔOI on first bar of the day" on (roll days), the base is today's first bar instead.
+f_inNSE(int ts) =>
+    int m = hour(ts) * 60 + minute(ts)
+    m >= SESS_START_MINS and m < SESS_END_MINS
+var float oiLastKnown = na      // last valid OI seen on any earlier bar
+var float oiDayBase   = na      // reference OI for today's cumulative ΔOI
+var int   oiDayKey    = na      // yyyymmdd of the day the base belongs to
+int  oiTodayKey = year * 10000 + month * 100 + dayofmonth
+bool oiInNSE    = timeframe.isintraday and f_inNSE(time)
+if oiInNSE and (na(oiDayKey) or oiTodayKey != oiDayKey)
+    oiDayKey  := oiTodayKey
+    oiDayBase := oiSkipFirst ? na : oiLastKnown
+if oiInNSE and na(oiDayBase) and not na(oiQty)
+    oiDayBase := oiQty
+float oiCumDay = oiInNSE and not na(oiQty) and not na(oiDayBase) ? oiQty - oiDayBase : na
+if not na(oiQty)
+    oiLastKnown := oiQty
+
+float slBarVol = not na(vQty) ? vQty : volume
+plot(f_slWhole(maxChildVol), "Child Vol", display=display.status_line, format=format.volume, precision=0, color=color.rgb(85, 255, 244), force_overlay=true)
+plot(f_slWhole(slBarVol), "Bar Vol", display=display.status_line, format=format.volume, precision=0, color=color.rgb(200, 200, 200), force_overlay=true)
+plot(f_slWhole(oiQty), "OI Qty", display=display.status_line, format=format.volume, precision=0, color=color.rgb(180, 180, 255), force_overlay=true)
+plot(not na(dOI) ? (oiDeltaPlain ? math.round(dOI / 1000.0) : f_slWhole(dOI)) : na, "ΔOI", display=display.status_line, format=oiDeltaPlain ? format.price : format.volume, precision=0, color=dOI < 0 ? C_DOI_DN : C_DOI_UP, force_overlay=true)
+plot(not na(dOIPct) ? math.round(dOIPct) : na, "ΔOI/Vol %", display=display.status_line, format=format.percent, precision=0, color=#FFFFFF, force_overlay=true)
+plot(not na(oiCumDay) ? (oiDeltaPlain ? math.round(oiCumDay / 1000.0) : f_slWhole(oiCumDay)) : na, "Day Cum ΔOI", display=display.status_line, format=oiDeltaPlain ? format.price : format.volume, precision=0, color=oiCumDay < 0 ? C_DOI_DN : C_DOI_UP, force_overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXACT READOUT (optional) — Indian comma grouping, ΔOI always in K
+// ═══════════════════════════════════════════════════════════════════════════
+f_inGroup(int n) =>
+    string s   = str.tostring(math.abs(n))
+    int    len = str.length(s)
+    string res = s
+    if len > 3
+        string headS = str.substring(s, 0, len - 3)
+        string grp   = ""
+        while str.length(headS) > 2
+            grp   := "," + str.substring(headS, str.length(headS) - 2) + grp
+            headS := str.substring(headS, 0, str.length(headS) - 2)
+        res := headS + grp + "," + str.substring(s, len - 3)
+    (n < 0 ? "-" : "") + res
+
+// Whole numbers; K from 1,000, M from 1,000,000 (volume and OI only, never ΔOI)
+f_kmWhole(float v) =>
+    float a = math.abs(v)
+    string body = math.round(a) < 1000 ? str.tostring(math.round(a)) : math.round(a / 1000.0) < 1000 ? str.tostring(math.round(a / 1000.0)) + "K" : str.tostring(math.round(a / 1000000.0)) + "M"
+    (v < 0 and body != "0" ? "-" : "") + body
+
+f_kOnly(float v) =>
+    int k = int(math.round(v / 1000.0))
+    f_inGroup(k) + "K"
+
+var table oiReadout = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 80), force_overlay=true)
+if oiShowReadout and barstate.islast
+    table.cell(oiReadout, 0, 0, "Child Vol", text_color=color.gray, text_size=size.small)
+    table.cell(oiReadout, 1, 0, f_kmWhole(maxChildVol), text_color=color.rgb(85, 255, 244), text_size=size.small)
+    table.cell(oiReadout, 0, 1, "Bar Vol",   text_color=color.gray, text_size=size.small)
+    table.cell(oiReadout, 1, 1, f_kmWhole(slBarVol), text_color=color.rgb(200, 200, 200), text_size=size.small)
+    table.cell(oiReadout, 0, 2, "OI Qty",    text_color=color.gray, text_size=size.small)
+    table.cell(oiReadout, 1, 2, na(oiQty) ? "–" : f_kmWhole(oiQty), text_color=color.rgb(180, 180, 255), text_size=size.small)
+    table.cell(oiReadout, 0, 3, "ΔOI",       text_color=color.gray, text_size=size.small)
+    table.cell(oiReadout, 1, 3, na(dOI) ? "–" : f_kOnly(dOI), text_color=na(dOI) or dOI >= 0 ? C_DOI_UP : C_DOI_DN, text_size=size.small)
+    table.cell(oiReadout, 0, 4, "ΔOI/Vol",   text_color=color.gray, text_size=size.small)
+    table.cell(oiReadout, 1, 4, na(dOIPct) ? "–" : str.tostring(math.round(dOIPct)) + "%", text_color=#FFFFFF, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOTTOM PANE — volume histogram + ΔOI label sitting on top of each volume bar
+//   · Columns: one per candle (x = the candle's own bar), green/red like TradingView's
+//     Volume. The pane auto-scales on volume only; nothing price-based is plotted here.
+//   · Label: x = the volume bar, y = that bar's VOLUME (pane units, not price), style
+//     label_down so the text's lower edge rests on the bar's top and grows upward.
+//   · An invisible "headroom" plot (volume × (1 + headroom%)) keeps space above the
+//     tallest bar so its label is never cut off.
+//   · Closed in-session bars only (no repaint). Labels are rebuilt for the bars on
+//     screen; when zoomed out they are thinned to the largest |ΔOI| per group so
+//     neighbours do not overlap. Format: 23K, -18K, 1,112K (Indian grouping).
+// ═══════════════════════════════════════════════════════════════════════════
+float paneVol = slBarVol
+color paneVolCol = close >= open ? color.new(volUpCol, volTr) : color.new(volDnCol, volTr)
+plot(paneVol, "Volume", paneVolCol, style=plot.style_columns, display=display.pane)
+plot(paneVol * (1.0 + volHeadroom / 100.0), "Label headroom", color.new(color.black, 100), display=display.pane, editable=false)
+
+float paneDOI = barstate.isconfirmed and f_inSess(time) and not na(dOI) ? dOI : na
+max_bars_back(paneDOI, 3000)
+max_bars_back(paneVol, 3000)
+max_bars_back(time, 3000)
+
+var array<label> paneLbls = array.new<label>()
+if barstate.islast
+    for lb in paneLbls
+        lb.delete()
+    paneLbls.clear()
+    int leftT   = chart.left_visible_bar_time
+    int rightT  = chart.right_visible_bar_time
+    int maxLook = math.min(bar_index, 2999)
+    // 1) how many bars are on screen
+    int nVis = 0
+    for i = 0 to maxLook
+        if time[i] < leftT
+            break
+        if time[i] <= rightT
+            nVis += 1
+    int step = oiAutoThin ? math.max(1, int(math.ceil(nVis / float(oiMaxAcross)))) : 1
+    step := math.max(step, int(math.ceil(nVis / 400.0)))      // stay inside the 500-label limit
+    // 2) one label per group of `step` bars: the bar with the largest |ΔOI|
+    array<int> picks = array.new<int>()
+    int   gKey  = na
+    int   gBest = na
+    float gAbs  = -1.0
+    for i = 0 to maxLook
+        if time[i] < leftT
+            break
+        if time[i] <= rightT and not na(paneDOI[i])
+            int   key = int(math.floor((bar_index - i) / float(step)))
+            float ab  = math.abs(paneDOI[i])
+            if na(gKey) or key != gKey
+                if not na(gBest)
+                    picks.push(gBest)
+                gKey  := key
+                gBest := i
+                gAbs  := ab
+            else if ab > gAbs
+                gBest := i
+                gAbs  := ab
+    if not na(gBest)
+        picks.push(gBest)
+    // 3) draw: x = the volume bar, y = its volume
+    for off in picks
+        int   k   = int(math.round(paneDOI[off] / 1000.0))
+        color col = k > 0 ? C_DOI_UP : k < 0 ? C_DOI_DN : color.gray
+        paneLbls.push(label.new(bar_index - off, paneVol[off], f_inGroup(k) + "K", yloc=yloc.price, style=label.style_label_down, color=color.new(color.black, 100), textcolor=col, size=f_size(oiPaneSize)))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OI ZONES — price bands where the most positive ΔOI was added
+//   WHAT IS EXACT: each bar's ΔOI (closed bars only, same OI feed as the status line).
+//   WHAT IS ESTIMATED: the PRICE at which that OI was added. The exchange publishes
+//   only how much OI changed, not at which price. So each bar's +ΔOI is placed by rule:
+//     · Narrow bar (range ≤ ATR × k, or ≤ points): spread evenly over low…high.
+//     · Other bars: split across the child (1-min) candles inside the bar by their
+//       share of volume, each share placed at that child's VWAP. A single 1-min
+//       candle's VWAP is not in the data feed, so it is estimated as (H+L+C)/3.
+//       If no child data is available, the bar falls back to the even spread.
+//   Only ΔOI > 0 is counted. Long vs short build-up is the bar's close vs the
+//   previous close. Bins are summed per trading day; the window is today plus the
+//   chosen number of previous days. Zones are redrawn on the last bar only, from
+//   closed bars only, so nothing repaints and nothing looks ahead.
+// ═══════════════════════════════════════════════════════════════════════════
+type OIDay
+    int             key
+    int             startBar
+    map<int, float> longQ
+    map<int, float> shortQ
+
+f_addBin(map<int, float> m, int k, float v) =>
+    m.put(k, nz(m.get(k)) + v)
+
+// Even spread over low…high, in proportion to how much of the range each bin covers
+f_spreadRange(map<int, float> m, float lo, float hi, float amt, float bs) =>
+    float rng = hi - lo
+    int   b0  = int(math.floor(lo / bs))
+    int   b1  = int(math.floor(hi / bs))
+    for b = b0 to b1
+        float ov = rng > 0.0 ? math.min(hi, (b + 1) * bs) - math.max(lo, b * bs) : 1.0
+        if ov > 0.0
+            f_addBin(m, b, rng > 0.0 ? amt * ov / rng : amt)
+    true
+
+var array<OIDay> zDaysArr = array.new<OIDay>()
+float zAtr    = ta.atr(zAtrLen)
+bool  zIsLong = close >= close[1]
+int   zDayKey = year * 10000 + month * 100 + dayofmonth
+
+if zShow and barstate.isconfirmed and f_inSess(time)
+    // open a new day bucket on the first in-session bar of each trading day
+    if zDaysArr.size() == 0 or zDaysArr.last().key != zDayKey
+        zDaysArr.push(OIDay.new(zDayKey, bar_index, map.new<int, float>(), map.new<int, float>()))
+        while zDaysArr.size() > zDays + 1
+            zDaysArr.shift()
+    if not na(dOI) and dOI > 0
+        OIDay zd = zDaysArr.last()
+        map<int, float> tgt = zIsLong ? zd.longQ : zd.shortQ
+        float rng    = high - low
+        bool  narrow = zNarrowMode == "Points" ? rng <= zNarrowPts : (not na(zAtr) and rng <= zNarrowAtr * zAtr)
+        int   nC     = chV.size()
+        float sumV   = 0.0
+        if not narrow and nC > 0
+            for j = 0 to nC - 1
+                if f_inSess(chT.get(j))
+                    sumV += nz(chV.get(j))
+        if narrow or sumV <= 0.0
+            f_spreadRange(tgt, low, high, dOI, zBin)
+        else
+            for j = 0 to nC - 1
+                float cv = nz(chV.get(j))
+                if cv > 0.0 and f_inSess(chT.get(j))
+                    float cVwap = (chH.get(j) + chL.get(j) + chC.get(j)) / 3.0
+                    f_addBin(tgt, int(math.floor(cVwap / zBin)), dOI * cv / sumV)
+
+var array<box> zBoxes = array.new<box>()
+if barstate.islast
+    for bx in zBoxes
+        bx.delete()
+    zBoxes.clear()
+    if zShow and zDaysArr.size() > 0
+        map<int, float> totL = map.new<int, float>()
+        map<int, float> totS = map.new<int, float>()
+        map<int, float> tot  = map.new<int, float>()
+        for d in zDaysArr
+            for [k, v] in d.longQ
+                f_addBin(totL, k, v)
+                f_addBin(tot, k, v)
+            for [k, v] in d.shortQ
+                f_addBin(totS, k, v)
+                f_addBin(tot, k, v)
+        array<int>   keys = tot.keys()
+        array<float> vals = tot.values()
+        int n = keys.size()
+        if n > 0
+            array<int> order_ = vals.sort_indices(order.descending)
+            float vMax = vals.get(order_.get(0))
+            int   lim  = math.min(zTopN, n)
+            int   zLeft = zDaysArr.first().startBar
+            for r = 0 to lim - 1
+                int   ii = order_.get(r)
+                int   k  = keys.get(ii)
+                float v  = vals.get(ii)
+                color base = zSplit ? (nz(totL.get(k)) >= nz(totS.get(k)) ? zLongCol : zShortCol) : zOneCol
+                int   tr   = int(math.round(zTrWeak - (zTrWeak - zTrStrong) * v / vMax))
+                string txt = zShowText ? "+" + f_inGroup(int(math.round(v / 1000.0))) + "K" : ""
+                zBoxes.push(box.new(zLeft, (k + 1) * zBin, bar_index, k * zBin, border_color=color.new(base, 100), bgcolor=color.new(base, tr), extend=extend.right, text=txt, text_size=size.tiny, text_color=color.new(base, 0), text_halign=text.align_right, force_overlay=true))
