@@ -1,0 +1,385 @@
+//@version=6
+indicator("OI Addition Tracker 1.00", "OIAT", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OI ADDITION TRACKER 1.00 — an indicator for TradingView's Pine Screener
+//   Tracks how consistently futures OI has been ADDED over the last few closed candles.
+//   Run it on a watchlist of F&O stocks' CASH symbols (for example NSE:RELIANCE), on ANY intraday timeframe.
+//   Only closed candles are used. Example: 30 min chart at 09:45 → the latest closed candle is 09:15–09:45, and the
+//   10 bars are that candle plus the 9 closed candles before it (going back into the previous day when needed).
+//
+//   EACH BAR (its exact window)
+//     ΔOI      = near-month (1!) OI change + next-month (2!) OI change over that candle. Fresh, not cumulative.
+//     OV ratio = 100 × ΔOI ÷ (near-month volume + next-month volume) over the same candle. Never cash volume.
+//     Valid only when both contracts' OI and volume candles start exactly with the cash candle and each contract's
+//     previous OI print is the cash chart's previous candle (same rules as First Candle OI Screener 1.03).
+//     Anything else (missing or misaligned candle, contract-roll morning, OV above 100%) is NOT valid: that bar is
+//     left out of every count, and "Valid bars" shows how many of the bars were usable.
+//     Added   = a valid bar with ΔOI > 0.
+//
+//   THE AVERAGE (the yardstick)
+//     Avg ΔOI and avg OV ratio = the mean of every valid candle that ADDED OI in the N candles BEFORE the bars being
+//     checked (any time of day, green or red). The checked bars never count towards their own average.
+//     "Above average" means strictly greater than the average.
+//
+//   RELATIVE VOLUME (cash, the latest closed candle only)
+//     = the latest closed candle's cash volume ÷ the average cash volume of the candles that started at the SAME
+//       time of day on the last N earlier days. 100 = normal for that time of day, 250 = 2.5 times normal.
+//     Empty when fewer than the minimum number of earlier days are loaded (1 and 3 min charts in the screener).
+//
+//   SCREENER COLUMNS (the first 10 plots, in this order)
+//     OI-added bars        how many of the valid bars added OI
+//     ΔOI above avg %      of the OI-added bars, the % whose ΔOI is above avg ΔOI (4 of 5 = 80)
+//     OV above avg %       of the OI-added bars, the % whose OV ratio is above avg OV ratio
+//     Highest ΔOI % of avg the biggest ΔOI among the OI-added bars, as a % of avg ΔOI (200 = twice the average)
+//     Highest OV % of avg  the biggest OV ratio among the OI-added bars, as a % of avg OV ratio
+//     Rel volume %         the latest closed candle's cash relative volume (see above)
+//     PD OI added %        the previous day's near + next OI change, % of the OI before it (+ added, − reduced)
+//     PD open to close %   the previous day's cash open to close, %
+//     Child %              the biggest child candle's share of the latest closed candle's cash volume
+//     Valid bars           how many of the bars checked had usable futures data (10 = all of them)
+//   Also in the data window and the chart table (not screener columns): Green % of OI-added bars, Avg ΔOI,
+//   Avg OV ratio %, Avg count.
+//
+//   No repainting: a candle is read only after it has closed, every request uses lookahead_off, and nothing comes
+//   from a later candle. Pine Screener limits respected: 5 data requests (exactly 5 here), no timeframe or symbol
+//   inputs, and only the last 500 candles of history (see the settings under "Averages").
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────── INPUTS ─────────────────────────────────
+grpB  = "The bars to check"
+kBars = input.int(10, "Bars to check", minval=1, maxval=50, group=grpB, display=display.none, tooltip="How many closed candles to check, ending with the latest closed candle. 10 = the latest closed candle and the 9 before it, going back into the previous day when today has fewer.")
+
+grpA = "Averages"
+avgN = input.int(488, "Average from the N candles before those bars", minval=10, maxval=5000, group=grpA, display=display.none, tooltip="Avg ΔOI and avg OV ratio come from every candle that added OI among these N candles, which sit just before the bars being checked. The Pine Screener holds only 500 candles: keep (bars to check + N) at 498 or less so the chart and the screener use exactly the same candles. 10 + 488 = 498. On 15 min that is about 19 days, on 5 min about 6.")
+
+grpR   = "Relative volume (cash)"
+rvDays = input.int(20, "Normal volume: same time of day on the last N days", minval=1, maxval=60, group=grpR, display=display.none, tooltip="Normal volume = the average cash volume of the candles that started at the same time as the latest closed candle on up to this many earlier days. Only days inside the same window as the averages (bars to check + N candles) are used, so the chart and the screener agree.")
+rvMin  = input.int(5, "Fewest days needed", minval=1, maxval=60, group=grpR, display=display.none, tooltip="With fewer earlier days than this, relative volume is left empty rather than shown from too few days. In the screener that happens on 1 and 3 min charts, because 500 candles hold only 1 to 4 days there.")
+
+grpC = "Child contribution"
+chTf = input.string("1 minute", "Child candle size", options=["1 second", "5 seconds", "10 seconds", "15 seconds", "30 seconds", "1 minute"], group=grpC, display=display.none, tooltip="The size of the small candles inside the latest closed candle. Child % = the biggest one's share of the candle's cash volume. Seconds need a Premium plan or higher, and the child must be shorter than the chart's candle (so on a 1 min chart pick seconds).")
+
+grpD  = "Chart"
+tblOn = input.bool(true, "Table of the bars checked", group=grpD, display=display.none, tooltip="Shown on a chart only, for checking the numbers bar by bar. The screener does not use it.")
+
+// ─────────────────────────── CHART CHECK AND CONSTANTS ───────────────────────────
+if not timeframe.isminutes
+    runtime.error("OI Addition Tracker: use an intraday timeframe from 1 minute to 4 hours.")
+
+const string NOSYM = "NSE:OIAT_NO_SYMBOL_0"        // deliberately invalid: a request that is not needed loads nothing
+int    W        = kBars + avgN                     // the whole window: the bars to check + the candles before them
+int    TF_MS    = timeframe.in_seconds() * 1000
+int    CH_SEC   = chTf == "1 second" ? 1 : chTf == "5 seconds" ? 5 : chTf == "10 seconds" ? 10 : chTf == "15 seconds" ? 15 : chTf == "30 seconds" ? 30 : 60
+string CH_TF    = CH_SEC < 60 ? str.tostring(CH_SEC) + "S" : "1"
+bool   CH_OK    = CH_SEC * 1000 < TF_MS            // a child must be shorter than the chart candle
+int    CH_BARS  = math.round(48000.0 / CH_SEC)     // child candles in two sessions of 400 minutes: covers the latest session
+
+// ─────────────────────────────── UTILITIES ───────────────────────────────
+// One time of day's cash volumes from earlier days, newest last
+type Slot
+    array<float> v                             // the candle's cash volume
+    array<int>   n                             // its closed-candle number, to keep it inside the window
+f_at(int t, int h, int m) => timestamp(syminfo.timezone, year(t), month(t), dayofmonth(t), h, m, 0)
+f_ymd(int t) => year(t) * 10000 + month(t) * 100 + dayofmonth(t)
+// A futures value's previous candle belongs to the cash chart's previous candle: same date, and not earlier
+f_prevOk(int prevT, float prevV, int pt) => not na(pt) and not na(prevT) and prevT >= pt and f_ymd(prevT) == f_ymd(pt) and not na(prevV)
+
+// ─────────────────────────────── DATA REQUESTS (5) ───────────────────────────────
+// Futures: near month (1!) and next month (2!) of the same stock, the chart's timeframe, gaps_on (no futures candle
+// at this time = na, never a carried value), lookahead_off. Each request returns its own candle's time, so the
+// alignment with the cash candle is checked, not assumed.
+string EXCH = syminfo.prefix == "BSE" ? "NSE" : syminfo.prefix
+string FUT1 = EXCH + ":" + syminfo.ticker + "1!"
+string FUT2 = EXCH + ":" + syminfo.ticker + "2!"
+f_oiReq() => [time, close, time[1], close[1]]      // this OI candle, and the one before it
+f_vReq() =>                                        // this volume candle, and the running total up to the one before it
+    float cum = ta.cum(nz(volume))
+    [time, volume, time[1], cum[1]]
+[n1T, n1C, n1PT, n1PC] = request.security(FUT1 + "_OI", timeframe.period, f_oiReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[n2T, n2C, n2PT, n2PC] = request.security(FUT2 + "_OI", timeframe.period, f_oiReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[v1T, v1V, v1PT, v1PQ] = request.security(FUT1, timeframe.period, f_vReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[v2T, v2V, v2PT, v2PQ] = request.security(FUT2, timeframe.period, f_vReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+// Child candles: the stock's own cash volume, one value per child candle inside this chart candle (with its start time)
+[cT, cV] = request.security_lower_tf(CH_OK ? syminfo.tickerid : NOSYM, CH_TF, [time, volume], ignore_invalid_symbol=true, ignore_invalid_timeframe=true, calc_bars_count=CH_BARS)
+
+// ─────────────────────────────── CANDLE AND DAY ───────────────────────────────
+// A candle counts only once it has closed. The time test also guards the screener's last candle while it is forming.
+bool closed = barstate.isconfirmed and (barstate.isrealtime or na(timenow) or time_close <= timenow)
+int  bD0    = f_at(time, 9, 15)
+bool inDay  = time >= bD0 and time < f_at(time, 16, 0)     // the regular day (no evening special sessions)
+bool cBar   = closed and inDay                              // a closed candle of the regular day
+int  pT     = time[1]                                       // the cash chart's previous candle
+var int dayKey = na
+bool newDay = cBar and (na(dayKey) or bD0 != dayKey)        // the day's first closed candle
+
+// ─────────────────────────────── THIS CANDLE'S FUTURES ───────────────────────────────
+bool o1 = not na(n1T) and n1T == time and n1C > 0 and f_prevOk(n1PT, n1PC, pT) and n1PC > 0
+bool o2 = not na(n2T) and n2T == time and n2C > 0 and f_prevOk(n2PT, n2PC, pT) and n2PC > 0
+bool q1 = not na(v1T) and v1T == time and not na(v1V)
+bool q2 = not na(v2T) and v2T == time and not na(v2V)
+// Contract roll (only possible overnight): today's near month looks like yesterday's next month
+bool roll = newDay and o1 and o2 and math.abs(n1C - n2PC) < math.abs(n1C - n1PC)
+float cD  = na                                     // this candle's ΔOI (na = not valid)
+float cO  = na                                     // this candle's OV ratio (na = not valid)
+if o1 and o2 and q1 and q2 and v1V + v2V > 0 and not roll
+    float d = (n1C - n1PC) + (n2C - n2PC)
+    float o = 100.0 * d / (v1V + v2V)
+    if math.abs(o) <= 100.0                        // above 100% is impossible inside one window: misaligned data
+        cD := d
+        cO := o
+
+// ─────────────────────────────── STATE ───────────────────────────────
+// Rolling window of the last W closed candles, oldest first
+var array<int>   hT = array.new_int()          // the candle's open time
+var array<float> hD = array.new_float()        // its ΔOI (na = not valid)
+var array<float> hO = array.new_float()        // its OV ratio (na = not valid)
+var array<bool>  hG = array.new_bool()         // it closed green (close above open)
+var int cbN = 0                                // closed candles counted so far
+// Same-time-of-day cash volume: one list per time of day, newest last, at most rvDays entries
+var map<int, Slot> slots = map.new<int, Slot>()
+// The latest closed candle
+var int   tT    = na
+var float tV    = na                           // its cash volume
+var float tRv   = na                           // relative volume, %
+var float tRvA  = na                           // normal volume for its time of day
+var int   tRvN  = 0                            // how many earlier days make up that normal volume
+var float chSh  = na                           // child share, %
+var float chCov = na                           // the children's volume ÷ the candle's volume, %
+var int   chT   = na                           // the biggest child's start time
+var int   chCd  = 1                            // 0 valid · 1 no child data · 2 child not shorter than the chart candle · 3 children do not add up
+// The day in progress, and the previous day
+var bool  dSt915 = false                       // it started at 09:15
+var float dOpen  = na
+var float dClose = na
+var int   dLastT = na                          // its latest closed candle's open time
+var float dOI0   = na                          // near + next OI at the previous day's close (na = not valid)
+var bool  dNoRoll = false                      // its first candle's OI is valid and shows no contract roll
+var bool  dSeen  = false                       // a day is in progress
+var int   pdT    = na                          // the previous day's 09:15
+var float pOI    = na                          // the previous day's OI added, %
+var float pOC    = na                          // the previous day's cash open to close, %
+
+// ─────────────────────────────── A NEW DAY: finish the previous one ───────────────────────────────
+if newDay
+    // The previous day's closing OI, read from each futures series' last candle before today's first candle
+    bool  pEnd = not na(pT) and pT + TF_MS >= f_at(pT, 15, 30)          // the cash chart's previous candle reached 15:30
+    float oiE  = pEnd and f_prevOk(n1PT, n1PC, pT) and n1PC > 0 and f_prevOk(n2PT, n2PC, pT) and n2PC > 0 ? n1PC + n2PC : na
+    if dSeen
+        pOI := not na(dOI0) and dNoRoll and not na(oiE) ? 100.0 * (oiE - dOI0) / dOI0 : na
+        pOC := dSt915 and pEnd and dLastT == pT and dOpen > 0 ? 100.0 * (dClose - dOpen) / dOpen : na
+        pdT := dayKey
+    // Start the new day
+    dayKey  := bD0
+    dSeen   := true
+    dSt915  := time == bD0
+    dOpen   := open
+    dOI0    := oiE
+    dNoRoll := o1 and o2 and not roll
+
+// ─────────────────────────────── EVERY CLOSED CANDLE ───────────────────────────────
+if cBar
+    cbN += 1
+    dClose := close
+    dLastT := time
+    // Into the rolling window
+    hT.push(time)
+    hD.push(cD)
+    hO.push(cO)
+    hG.push(close > open)
+    while hT.size() > W
+        hT.shift()
+        hD.shift()
+        hO.shift()
+        hG.shift()
+    // Same time of day list for this candle
+    int  sk = hour(time, syminfo.timezone) * 60 + minute(time, syminfo.timezone)
+    Slot sl = slots.get(sk)
+    if na(sl)
+        sl := Slot.new(array.new_float(), array.new_int())
+        slots.put(sk, sl)
+    tT := time
+    tV := volume
+    // Worked out only for the last two candles, because only the latest closed candle is ever shown
+    if bar_index >= last_bar_index - 1
+        // Relative volume: earlier days at this time of day, inside the window, newest first
+        float s = 0.0
+        int   c = 0
+        int   m = sl.v.size()
+        if m > 0
+            for i = m - 1 to 0
+                if c >= rvDays
+                    break
+                if sl.n.get(i) > cbN - W
+                    s += sl.v.get(i)
+                    c += 1
+        tRvN := c
+        tRvA := c > 0 ? s / c : na
+        tRv  := c >= rvMin and s > 0 and not na(volume) ? 100.0 * volume / (s / c) : na
+        // Child contribution: exact only, so the child candles must add up to the candle's own volume
+        chSh  := na
+        chCov := na
+        chT   := na
+        chCd  := 1
+        if not CH_OK
+            chCd := 2
+        else if not na(cV) and not na(cT) and cV.size() > 0 and volume > 0
+            float cs = 0.0
+            float cb = -1.0
+            int   ct = na
+            for i = 0 to cV.size() - 1
+                float v = nz(cV.get(i))
+                cs += v
+                if v > cb
+                    cb := v
+                    ct := cT.get(i)
+            chCov := 100.0 * cs / volume
+            chT   := ct
+            if math.abs(cs - volume) < 0.5
+                chSh := 100.0 * cb / volume
+                chCd := 0
+            else
+                chCd := 3
+    // Then add this candle to its time-of-day list
+    if not na(volume)
+        sl.v.push(volume)
+        sl.n.push(cbN)
+        if sl.v.size() > rvDays
+            sl.v.shift()
+            sl.n.shift()
+
+// ─────────────────────────────── THE BARS CHECKED AND THEIR AVERAGE ───────────────────────────────
+int   hn   = hT.size()
+int   kk   = math.min(kBars, hn)                // bars actually checked (fewer only when history is short)
+int   b0   = hn - kk                            // index of the oldest bar checked; the average uses 0 .. b0 - 1
+float aOI  = na                                 // avg ΔOI
+float aOV  = na                                 // avg OV ratio
+int   aN   = 0                                  // candles that make up the average
+int   nV   = 0                                  // valid bars
+int   nA   = 0                                  // OI-added bars
+int   nAO  = 0                                  // OI-added bars with ΔOI above avg
+int   nAV  = 0                                  // OI-added bars with OV ratio above avg
+int   nG   = 0                                  // OI-added bars that closed green
+float mxD  = na                                 // the biggest ΔOI among the OI-added bars
+float mxO  = na                                 // the biggest OV ratio among the OI-added bars
+int   mxDT = na
+int   mxOT = na
+if barstate.islast and kk > 0
+    float zD = 0.0
+    float zO = 0.0
+    if b0 > 0
+        for i = 0 to b0 - 1
+            float d = hD.get(i)
+            if not na(d) and d > 0
+                zD += d
+                zO += hO.get(i)
+                aN += 1
+    aOI := aN > 0 ? zD / aN : na
+    aOV := aN > 0 ? zO / aN : na
+    for i = b0 to hn - 1
+        float d = hD.get(i)
+        if not na(d)
+            nV += 1
+            if d > 0
+                float o = hO.get(i)
+                nA += 1
+                nAO += not na(aOI) and d > aOI ? 1 : 0
+                nAV += not na(aOV) and o > aOV ? 1 : 0
+                nG  += hG.get(i) ? 1 : 0
+                if na(mxD) or d > mxD
+                    mxD  := d
+                    mxDT := hT.get(i)
+                if na(mxO) or o > mxO
+                    mxO  := o
+                    mxOT := hT.get(i)
+f_pc(float v, float a) => na(v) or na(a) or a <= 0 ? na : 100.0 * v / a
+
+// ─────────────────────────────── SCREENER COLUMNS (the first 10 plots) ───────────────────────────────
+// Not drawn on the chart: the values appear in the Pine Screener and in the chart's data window.
+bool  show  = kk > 0 and not na(tT)
+float oA    = show and nV > 0 ? nA : na
+float oAO   = show and nA > 0 and not na(aOI) ? 100.0 * nAO / nA : na
+float oAV   = show and nA > 0 and not na(aOV) ? 100.0 * nAV / nA : na
+float oMxD  = show ? f_pc(mxD, aOI) : na
+float oMxO  = show ? f_pc(mxO, aOV) : na
+float oRv   = show ? tRv : na
+float oPOI  = show ? pOI : na
+float oPOC  = show ? pOC : na
+float oCh   = show ? chSh : na
+float oV    = show ? nV : na
+float oG    = show and nA > 0 ? 100.0 * nG / nA : na
+float oAOI  = show ? aOI : na
+float oAOV  = show ? aOV : na
+float oAN   = show ? aN : na
+plot(oA, "OI-added bars", #2962FF, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(oAO, "ΔOI above avg %", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(oAV, "OV above avg %", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(oMxD, "Highest ΔOI % of avg", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(oMxO, "Highest OV % of avg", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(oRv, "Rel volume %", #FF9800, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(oPOI, "PD OI added %", #9C27B0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(oPOC, "PD open to close %", #9C27B0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(oCh, "Child %", #00ACC1, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(oV, "Valid bars", #787B86, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+// Data window only (after the first 10, so not screener columns)
+plot(oG, "Green % of OI-added bars", #787B86, display=display.data_window, precision=1)
+plot(oAOI, "Avg ΔOI", #787B86, display=display.data_window, format=format.volume)
+plot(oAOV, "Avg OV ratio %", #787B86, display=display.data_window, precision=2)
+plot(oAN, "Avg count", #787B86, display=display.data_window, precision=0)
+
+// ─────────────────────────────── TABLE (chart only) ───────────────────────────────
+f_cell(table t, int c, int r, string s, color tc, color bg = na) =>
+    table.cell(t, c, r, s, text_color=tc, bgcolor=bg, text_size=size.small, text_halign=text.align_left)
+f_k(float v) => na(v) ? "–" : (v > 0 ? "+" : "") + str.tostring(v, format.volume)
+f_p(float x) => na(x) ? "–" : str.tostring(x, "0.0") + "%"
+f_sp(float x) => na(x) ? "–" : (x > 0 ? "+" : "") + str.tostring(x, "0.00") + "%"
+f_hm(int t) => na(t) ? "–" : str.format_time(t, "dd MMM HH:mm", syminfo.timezone)
+f_of(int a, int b) => str.tostring(a) + " of " + str.tostring(b) + (b > 0 ? " = " + str.tostring(100.0 * a / b, "0") + "%" : "")
+
+int ROWS = 12 + kBars
+var table tb = tblOn ? table.new(position.top_right, 3, ROWS, bgcolor=color.new(chart.bg_color, 5), frame_color=color.new(chart.fg_color, 75), frame_width=1, border_color=color.new(chart.fg_color, 88), border_width=1) : na
+if tblOn and barstate.islast
+    color TX = chart.fg_color
+    color MU = color.new(chart.fg_color, 45)
+    color HB = color.new(chart.fg_color, 90)
+    color UP = #26A69A
+    color DN = #EF5350
+    tb.clear(0, 0, 2, ROWS - 1)
+    f_cell(tb, 0, 0, "OI Addition Tracker · " + str.tostring(timeframe.multiplier) + " min", TX, HB)
+    f_cell(tb, 1, 0, show ? str.tostring(kk) + " bars: " + f_hm(hT.get(b0)) + " to " + f_hm(tT) : "no closed candle yet", TX, HB)
+    f_cell(tb, 2, 0, "", TX, HB)
+    if show
+        f_cell(tb, 0, 1, "OI-added bars", TX)
+        f_cell(tb, 1, 1, str.tostring(nA) + " of " + str.tostring(nV) + " valid bars (" + str.tostring(kk - nV) + " without usable data)", MU)
+        f_cell(tb, 0, 2, "Average (yardstick)", TX)
+        f_cell(tb, 1, 2, na(aOI) ? "no candle added OI before the bars checked" : "ΔOI " + f_k(aOI) + " · OV " + f_p(aOV) + " · from " + str.tostring(aN) + " of the " + str.tostring(b0) + " candles before", MU)
+        f_cell(tb, 0, 3, "ΔOI above avg", TX)
+        f_cell(tb, 1, 3, nA > 0 and not na(aOI) ? f_of(nAO, nA) : "–", MU)
+        f_cell(tb, 0, 4, "OV above avg", TX)
+        f_cell(tb, 1, 4, nA > 0 and not na(aOV) ? f_of(nAV, nA) : "–", MU)
+        f_cell(tb, 0, 5, "Highest ΔOI", TX)
+        f_cell(tb, 1, 5, na(mxD) ? "–" : f_p(oMxD) + " of avg (" + f_k(mxD) + ") at " + f_hm(mxDT), MU)
+        f_cell(tb, 0, 6, "Highest OV ratio", TX)
+        f_cell(tb, 1, 6, na(mxO) ? "–" : f_p(oMxO) + " of avg (" + f_p(mxO) + ") at " + f_hm(mxOT), MU)
+        f_cell(tb, 0, 7, "Rel volume (latest candle)", TX)
+        f_cell(tb, 1, 7, na(tRv) ? "unavailable: " + str.tostring(tRvN) + " earlier days at this time, " + str.tostring(rvMin) + " needed" : f_p(tRv) + " · " + str.tostring(tV, format.volume) + " vs normal " + str.tostring(tRvA, format.volume) + " (" + str.tostring(tRvN) + " days)", MU)
+        f_cell(tb, 0, 8, "PD OI added" + (na(pdT) ? "" : " (" + str.format_time(pdT, "dd MMM", syminfo.timezone) + ")"), TX)
+        f_cell(tb, 1, 8, na(pOI) ? "unavailable (roll day, partial day or missing data)" : f_sp(pOI), na(pOI) ? MU : pOI > 0 ? UP : DN)
+        f_cell(tb, 0, 9, "PD open to close", TX)
+        f_cell(tb, 1, 9, na(pOC) ? "unavailable (partial day or missing data)" : f_sp(pOC), na(pOC) ? MU : pOC > 0 ? UP : DN)
+        string chTxt = chCd == 0 ? f_p(chSh) + " · biggest child at " + str.format_time(chT, CH_SEC < 60 ? "HH:mm:ss" : "HH:mm", syminfo.timezone) : chCd == 2 ? "the child must be shorter than the chart candle" : chCd == 3 ? "children hold " + f_p(chCov) + " of the candle's volume, not 100%" : "no child data"
+        f_cell(tb, 0, 10, "Child % (" + chTf + ")", TX)
+        f_cell(tb, 1, 10, chTxt, MU)
+        // One row per bar checked, newest first
+        f_cell(tb, 0, 11, "Bar", MU, HB)
+        f_cell(tb, 1, 11, "ΔOI (% of avg)", MU, HB)
+        f_cell(tb, 2, 11, "OV ratio (% of avg)", MU, HB)
+        for j = 0 to kk - 1
+            int   i = hn - 1 - j
+            float d = hD.get(i)
+            float o = hO.get(i)
+            bool  a = not na(d) and d > 0
+            color c = na(d) ? MU : a ? UP : DN
+            f_cell(tb, 0, 12 + j, f_hm(hT.get(i)) + (hG.get(i) ? " · green" : " · not green"), MU)
+            f_cell(tb, 1, 12 + j, na(d) ? "no usable data" : f_k(d) + (a and not na(aOI) ? " (" + f_p(f_pc(d, aOI)) + ")" : ""), c)
+            f_cell(tb, 2, 12 + j, na(d) ? "–" : f_p(o) + (a and not na(aOV) ? " (" + f_p(f_pc(o, aOV)) + ")" : ""), c)
