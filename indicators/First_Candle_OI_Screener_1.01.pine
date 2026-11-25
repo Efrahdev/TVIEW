@@ -1,8 +1,8 @@
 //@version=6
-indicator("First Candle OI Screener 1.00", "FCOI Screener", overlay=true)
+indicator("First Candle OI Screener 1.01", "FCOI Screener", overlay=true, calc_bars_count=500)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FIRST CANDLE OI SCREENER 1.00 — an indicator for TradingView's Pine Screener
+// FIRST CANDLE OI SCREENER 1.01 — an indicator for TradingView's Pine Screener
 //   Run it on a watchlist of F&O stocks' CASH symbols (for example NSE:RELIANCE), on ANY intraday timeframe.
 //   First candle = the session's first chart candle, from 09:15: 09:15–09:20 on 5 min, 09:15–09:30 on 15 min.
 //   Every value belongs to the latest session's first candle and stays fixed for the day once that candle closes.
@@ -16,7 +16,10 @@ indicator("First Candle OI Screener 1.00", "FCOI Screener", overlay=true)
 //     (F&O trades to 15:40 since 3 Aug 2026 and to 15:45 from 7 Dec 2026; the cash chart stops at 15:30).
 //     Anything else is unavailable, never a guess, a zero or one expiry: a missing or misaligned candle, a
 //     contract-roll morning, or an OV ratio above 100% (impossible inside one window, so the data is misaligned).
-//     Average  = the mean of the first candles that ADDED OI (ΔOI > 0) in the last N sessions, fixed for the day.
+//     Average  = the mean size (ignoring sign) of the first candles' ΔOI and OV ratio over the last N sessions
+//                (or, by choice, only of those that ADDED OI), fixed for the day. Needs at least M sessions.
+//     The chart also calculates only the last 500 candles (calc_bars_count), exactly like the Pine Screener,
+//     so the chart and the screener always show the same averages and percentages.
 //     Child contribution = the biggest child candle's cash volume ÷ the first candle's cash volume. Used only when
 //     the child candles add up exactly to the first candle's volume, so a missing child can never distort it.
 //     Previous day's VWAP = the stock's own VWAP of the last full session, from the chart's candles.
@@ -35,7 +38,7 @@ indicator("First Candle OI Screener 1.00", "FCOI Screener", overlay=true)
 //     OV ratio %     the first candle's OV ratio
 //     Avg count      how many first candles the average is made of
 //     Data           0 all data present for the ticked checks · 1 first candle not closed yet · 2 no 09:15 candle
-//                    · 3 futures data unavailable · 4 average not ready · 5 child data incomplete · 6 no previous-day VWAP
+//                    · 3 futures data unavailable · 4 average not ready (fewer than the minimum sessions) · 5 child data incomplete · 6 no previous-day VWAP
 //
 //   No repainting: a candle is read only after it has closed, every request uses lookahead_off, and nothing comes
 //   from a later candle. Pine Screener limits respected: 5 data requests (exactly 5 here), inputs it can change
@@ -57,7 +60,9 @@ pdOn   = input.bool(true, "6 · Previous day's VWAP: green above it, red below i
 pdAt   = input.string("First candle's close", "Price compared with the VWAP (for check 6)", options=["First candle's close", "Latest closed candle"], group=grpC, display=display.none, tooltip="First candle's close: fixed for the day once the first candle closes.\nLatest closed candle: the close of the newest closed candle, so the result can change during the day. Green or red still means the first candle's colour.")
 
 grpA = "Average"
-avgN = input.int(20, "Average of the first candles of the last N sessions", minval=1, maxval=100, group=grpA, display=display.none, tooltip="How many past sessions make up 'average'. Only first candles that added OI are averaged.\nThe Pine Screener loads only the last 500 candles: the full 20 sessions from 30 minutes up, about 19 on 15 minutes, 5 to 6 on 5 minutes, at most 1 on 1 minute. With fewer than N loaded, it averages what it has, and the Avg count column shows how many first candles that is.")
+avgN = input.int(20, "Average of the first candles of the last N sessions", minval=1, maxval=100, group=grpA, display=display.none, tooltip="How many past sessions make up 'average'.\nTradingView loads only the last 500 candles (the chart is limited the same way, so both match): the full 20 sessions from 30 minutes up, about 19 on 15 minutes, about 6 on 5 minutes, none on 1 minute. With fewer than N loaded, it averages what it has, and the Avg count column shows how many.")
+avgMin = input.int(5, "Minimum sessions for an average", minval=1, maxval=100, group=grpA, display=display.none, tooltip="With fewer valid first candles than this in the average, checks 3 and 4 show 'average not ready' (Data 4) instead of a percentage built on too little history.")
+avgBy = input.string("Every session (size of the OI change)", "Sessions in the average", options=["Every session (size of the OI change)", "Only sessions that added OI"], group=grpA, display=display.none, tooltip="Every session: each session's first candle counts, by the size of its OI change and OV ratio whether OI rose or fell, so Avg count equals the sessions loaded.\nOnly sessions that added OI: averages just the first candles whose OI rose, so Avg count can be much smaller.")
 
 grpD  = "Chart"
 tblOn = input.bool(true, "Table of the latest first candle", group=grpD, display=display.none, tooltip="Shown on a chart only, for checking the numbers. The screener does not use it.")
@@ -74,6 +79,7 @@ bool   CH_OK    = CH_SEC < TF_SEC                  // a child must be shorter th
 int    CH_BARS  = math.round(48000.0 / CH_SEC)     // child candles in two sessions of 400 minutes: covers the latest session
 bool   FUT_ON   = oiOn or ovOn                     // futures data is loaded only when check 3 or 4 is on
 bool   PD_FIRST = pdAt == "First candle's close"
+bool   AVG_ALL  = avgBy == "Every session (size of the OI change)"
 
 // ─────────────────────────────── UTILITIES ───────────────────────────────
 f_at(int t, int h, int m) => timestamp(syminfo.timezone, year(t), month(t), dayofmonth(t), h, m, 0)
@@ -115,7 +121,7 @@ bool newDay = isNew and closed                              // the session's fir
 bool waitFc = isNew and not closed                          // the session's first candle is still forming
 
 // ─────────────────────────────── STATE ───────────────────────────────
-var array<float> hOI = array.new_float()   // first-candle ΔOI, one row per session, oldest first (na = OI not added or no data)
+var array<float> hOI = array.new_float()   // first-candle |ΔOI|, one row per session, oldest first (na = no data, or OI not added in that mode)
 var array<float> hOV = array.new_float()   // its OV ratio, same rows
 var bool  rec    = false                   // true from the first session that starts at 09:15 (a partial first day is never used)
 var float vwPV   = 0.0                     // this session's VWAP sums
@@ -151,8 +157,8 @@ if newDay
     // Today's averages: earlier sessions only, fixed for the whole day
     [mO, nO] = f_mean(hOI)
     [mV, nV] = f_mean(hOV)
-    refOI := mO
-    refOV := mV
+    refOI := nO >= avgMin ? mO : na
+    refOV := nV >= avgMin ? mV : na
     refN  := nO
     refS  := hOI.size()
     // The first candle
@@ -209,9 +215,9 @@ if newDay
                 chCd := 3
     // Today's first candle joins the history, used from tomorrow
     if rec
-        bool added = futCd == 0 and fcDoi > 0
-        hOI.push(added ? fcDoi : na)
-        hOV.push(added ? fcOv : na)
+        bool keep = futCd == 0 and (AVG_ALL or fcDoi > 0)
+        hOI.push(keep ? math.abs(fcDoi) : na)
+        hOV.push(keep ? math.abs(fcOv) : na)
         while hOI.size() > avgN
             hOI.shift()
             hOV.shift()
@@ -302,7 +308,7 @@ if tblOn and barstate.islast
     f_cell(tb, 2, 5, show ? f_ok(kPd, pdOn) : "–", TX)
 
     f_cell(tb, 0, 6, "Average", MU)
-    f_cell(tb, 1, 6, FUT_ON ? str.tostring(refN) + " of the last " + str.tostring(refS) + " sessions' first candles added OI" : "not loaded (checks 3 and 4 are off)", MU)
+    f_cell(tb, 1, 6, FUT_ON ? str.tostring(refN) + " of the last " + str.tostring(refS) + (AVG_ALL ? " sessions have valid data" : " sessions added OI") + " (minimum " + str.tostring(avgMin) + ")" : "not loaded (checks 3 and 4 are off)", MU)
     f_cell(tb, 2, 6, "", MU)
 
     string why = ""
@@ -315,7 +321,7 @@ if tblOn and barstate.islast
     else if code == 3
         why := futCd == 2 ? "contract-roll morning: 1! and 2! switched contracts" : futCd == 3 ? "OV ratio above 100%: OI and volume are not from the same window" : "futures OI or volume missing, or not stamped to the first candle"
     else if code == 4
-        why := "no earlier first candle that added OI is loaded yet"
+        why := "fewer than " + str.tostring(avgMin) + " earlier first candles in the average (" + str.tostring(refN) + " loaded)"
     else if code == 5
         why := chTxt
     else
