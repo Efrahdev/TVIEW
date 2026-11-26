@@ -1,0 +1,465 @@
+//@version=6
+indicator("F&O Sector OI Screener 1.00", "FOSS", overlay=true, calc_bars_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F&O SECTOR OI SCREENER 1.00 — for TradingView's Pine Screener (Premium and above)
+//   Run it on a watchlist of F&O stocks' CASH symbols (for example NSE:RELIANCE), on an intraday timeframe
+//   (15 min recommended: 500 candles = 20 days, enough for relative volume).
+//   Every number is worked out AS AT THE LATEST CLOSED CANDLE of today's regular day (09:15–15:30).
+//   A candle that is still forming is never used.
+//
+//   HOW IT GETS SECTOR NUMBERS IN A SCREENER (where each row is a separate run that cannot see other rows)
+//     Each row also asks for ONE formula symbol that adds up its whole sector, for example
+//       NSE:TCS1!_OI*3100+NSE:TCS2!_OI*3100+NSE:INFY1!_OI*1500+...
+//     TradingView adds it up on its own servers, so the whole sector costs one data request.
+//       Sector OI    = Σ (near + next month OI) × the stock's FIXED reference price, so a price move alone can
+//                      never look like OI being added. Shown as % change and ₹ crore.
+//       Sector price = Σ (cash price ÷ reference price): its % change is the sector's equal-weight price move.
+//       Sector RVOL  = the price formula's volume, against its own normal (same method as the stock's RVOL).
+//     Sector lists and reference prices: the SECTOR TABLE block below (generated from
+//     sector_universe/FO_Sector_Universe_2026-11.csv). A stock not in the table gets sector 0 and no sector columns.
+//
+//   SCREENER COLUMNS (the first 10 are shown by default; add the rest with "Manage columns")
+//     1  Bias           the stock's reading: +2 long build-up · +1 short covering · 0 neutral ·
+//                       −1 long unwinding · −2 short build-up. Sort high to low: bullish at the top, bearish at the
+//                       bottom. 2 = fresh positions (OI up), 1 = positions closing (OI down).
+//                       Neutral when price or OI moved less than its band (inputs).
+//     2  Price %        cash, the latest closed candle against the previous day's close
+//     3  OI %           near + next month futures OI against the previous day's last prints (roll morning: the one
+//                       contract both days share, as in your FCOI Screener)
+//     4  OI ₹ cr        that OI change × price, in ₹ crore (assumes TradingView's OI is in shares)
+//     5  RVOL %         cash volume from 09:15 to this candle ÷ the average volume from 09:15 to the same time on
+//                       the last N earlier days (at least the minimum). 100 = normal for this time of day.
+//     6  Sector         sector code (list below)
+//     7  Sec OI %       the sector's OI change today, %
+//     8  Sec price %    the sector's equal-weight price change today, %
+//     9  Sec RVOL %     the sector's relative volume (empty if TradingView gives no volume for formula symbols)
+//     10 Group key      ONE sort that groups the list: sort it high to low and the sectors come out ranked (by
+//                       "Rank sectors by"), each sector's stocks stay together, and inside each sector the stocks are
+//                       ranked (by "Rank stocks by"). A sector → stock tree in one click.
+//     11 Sec bias       the sector's reading, same codes as Bias
+//     12 Sec OI ₹ cr    the sector's OI change today, ₹ crore
+//     13 OI % last N    the stock's OI change over the last N closed candles of today, % of the day's base
+//     14 Sec OI % last N  the same for the sector: is the adding happening NOW?
+//     15 vs Sector %    the stock's price % minus its sector's price %
+//     16 Nifty %        NIFTY 50, the latest closed candle against the previous close
+//     17 vs Nifty %     the stock's price % minus Nifty's
+//     18 Sector row     1 for one stock per sector (the first in its list). Filter "= 1" and the list collapses to
+//                       one row per sector; sort by Sec OI % and the sectors are ranked.
+//     19 Data           0 all good · 1 contract-roll morning (OI from the shared contract / the day's first print)
+//                       · 2 the stock's futures OI is missing · 3 stock not in the sector table · 4 the sector
+//                       formula returned nothing · 5 sector columns switched off
+//
+//   SECTOR CODES
+//     1 Private Banks · 2 PSU Banks · 3 NBFC and Lending · 4 Capital Markets and Insurance · 5 IT ·
+//     6 Pharma and Healthcare · 7 Auto OEM · 8 Auto Components · 9 FMCG · 10 Metals and Mining · 11 Oil and Gas ·
+//     12 Power · 13 Capital Goods and Defence · 14 Cement · 15 Realty · 16 Infra and Logistics · 17 Telecom ·
+//     18 Consumer Durables · 19 Consumer Services · 20 Chemicals and Paints
+//
+//   FILTER PRESETS (the script's alert conditions; the screener offers them as yes/no filters)
+//     Long build-up + high RVOL · Short build-up + high RVOL · Short covering + high RVOL · Quiet OI decline
+//     (OI down, RVOL below high) · Against its sector (stock and sector readings point opposite ways) ·
+//     Sector adding OI
+//
+//   DATA REQUESTS: exactly 5, the Pine Screener's limit: near-month OI, next-month OI, the sector OI formula, the
+//   sector price formula, NIFTY 50. No timeframe, symbol or time inputs. 500 candles, like the screener.
+//   No repainting: every request uses lookahead_off, values are taken only from closed candles, and nothing
+//   comes from a later candle.
+//   NOT TESTED ON TRADINGVIEW YET: formula symbols with _OI, their size limit and their volume are unconfirmed.
+//   If the sector columns stay empty (Data = 4), run FO_Sector_Check_1.00 to find the cause.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────── INPUTS ─────────────────────────────────
+grpB    = "Readings (bias)"
+pxBand  = input.float(0.25, "Stock: price neutral band ±%", minval=0, step=0.05, group=grpB, display=display.none, tooltip="A stock whose price moved less than this (either way) reads 0, neutral.")
+oiBand  = input.float(1.0, "Stock: OI neutral band ±%", minval=0, step=0.1, group=grpB, display=display.none, tooltip="A stock whose OI changed less than this (either way) reads 0, neutral.")
+sPxBand = input.float(0.25, "Sector: price neutral band ±%", minval=0, step=0.05, group=grpB, display=display.none)
+sOiBand = input.float(0.5, "Sector: OI neutral band ±%", minval=0, step=0.1, group=grpB, display=display.none, tooltip="Sector totals move less than single stocks, so the sector band is smaller.")
+rvHi    = input.float(150, "High relative volume (RVOL %)", minval=0, step=10, group=grpB, display=display.none, tooltip="Used by the filter presets. 150 = one and a half times normal for this time of day.")
+lastN   = input.int(3, "Recent OI change: the last N candles", minval=1, maxval=50, group=grpB, display=display.none, tooltip="Columns 13 and 14: OI change over the last N closed candles of today (from the day's start when fewer have closed).")
+grpK    = "Group key (column 10)"
+keySec  = input.string("Sector OI %", "Rank sectors by", options=["Sector OI %", "Sector OI ₹ cr", "Sector price %", "Sector RVOL %", "Sector code"], group=grpK, display=display.none, tooltip="Sort the Group key column high to low: sectors come out in this order, highest first.")
+keyStk  = input.string("OI %", "Rank stocks inside a sector by", options=["OI %", "OI ₹ cr", "Price %", "RVOL %"], group=grpK, display=display.none)
+grpR    = "Relative volume"
+rvDays  = input.int(20, "Normal volume: same time of day on the last N days", minval=1, maxval=60, group=grpR, display=display.none, tooltip="The screener holds 500 candles: on 15 min about 19 earlier days, on 5 min about 5.")
+rvMin   = input.int(5, "Fewest earlier days needed", minval=1, maxval=60, group=grpR, display=display.none, tooltip="With fewer earlier days loaded, RVOL stays empty.")
+grpS    = "Sector columns"
+secOn   = input.bool(true, "Sector columns (2 formula requests)", group=grpS, display=display.none, tooltip="Off: columns 7–9, 11, 12, 14 and 15 stay empty and the two formula requests load nothing. Use this if TradingView refuses the formula symbols.")
+tblOn   = input.bool(true, "Table on the chart", group=grpS, display=display.none, tooltip="Shown on a chart only, for checking the numbers. The screener does not use it.")
+
+// ─────────────────────────── CHART CHECK AND CONSTANTS ───────────────────────────
+if not timeframe.isminutes
+    runtime.error("FOSS: use an intraday timeframe (1 minute to 4 hours). 15 minutes is recommended.")
+
+const string TZ       = "Asia/Kolkata"
+const string NOSYM    = "NSE:FOSS_NO_SYMBOL_0"     // deliberately invalid: a request that is not needed loads nothing
+const float  ROLL_TOL = 0.05                       // a sector total that opens >5% away from yesterday's last print = roll morning
+int TF_MIN  = math.max(1, math.round(timeframe.in_seconds() / 60))
+int MAXSLOT = math.max(1, math.ceil(375.0 / TF_MIN))  // candles in the regular day, 09:15–15:30
+
+// ── SECTOR TABLE: generated from FO_Sector_Universe_2026-11.csv by gen_sector_block.py. Edit the CSV, not this block. ──
+const string SEC_NAMES = "Not in list|Private Banks|PSU Banks|NBFC and Lending|Capital Markets and Insurance|IT|Pharma and Healthcare|Auto OEM|Auto Components|FMCG|Metals and Mining|Oil and Gas|Power|Capital Goods and Defence|Cement|Realty|Infra and Logistics|Telecom|Consumer Durables|Consumer Services|Chemicals and Paints"
+const string LEADERS   = ",HDFCBANK,SBIN,BAJFINANCE,HDFCLIFE,TCS,SUNPHARMA,MARUTI,TIINDIA,HINDUNILVR,TATASTEEL,RELIANCE,NTPC,LT,ULTRACEMCO,DLF,ADANIENT,BHARTIARTL,TITAN,TRENT,PIIND,"
+const string M_01 = ",HDFCBANK,ICICIBANK,AXISBANK,KOTAKBANK,INDUSINDBK,FEDERALBNK,IDFCFIRSTB,AUBANK,BANDHANBNK,YESBANK,RBLBANK,"
+const string M_02 = ",SBIN,BANKBARODA,PNB,CANBK,UNIONBANK,INDIANB,BANKINDIA,"
+const string M_03 = ",BAJFINANCE,BAJAJFINSV,SHRIRAMFIN,CHOLAFIN,MUTHOOTFIN,MANAPPURAM,LICHSGFIN,SBICARD,LTF,M_MFIN,ABCAPITAL,POONAWALLA,PFC,RECLTD,JIOFIN,"
+const string M_04 = ",HDFCLIFE,SBILIFE,ICICIPRULI,ICICIGI,LICI,HDFCAMC,BSE,CDSL,MCX,ANGELONE,CAMS,"
+const string M_05 = ",TCS,INFY,HCLTECH,WIPRO,TECHM,LTIM,MPHASIS,COFORGE,PERSISTENT,OFSS,KPITTECH,TATAELXSI,LTTS,"
+const string M_06 = ",SUNPHARMA,DRREDDY,CIPLA,DIVISLAB,LUPIN,AUROPHARMA,ZYDUSLIFE,TORNTPHARM,ALKEM,BIOCON,GLENMARK,MANKIND,LAURUSLABS,APOLLOHOSP,MAXHEALTH,SYNGENE,"
+const string M_07 = ",MARUTI,M_M,TMPV,BAJAJ_AUTO,EICHERMOT,HEROMOTOCO,TVSMOTOR,ASHOKLEY,"
+const string M_08 = ",TIINDIA,BHARATFORG,MOTHERSON,BOSCHLTD,EXIDEIND,SONACOMS,"
+const string M_09 = ",HINDUNILVR,ITC,NESTLEIND,BRITANNIA,DABUR,GODREJCP,MARICO,COLPAL,TATACONSUM,UNITDSPR,VBL,PATANJALI,"
+const string M_10 = ",TATASTEEL,JSWSTEEL,HINDALCO,VEDL,SAIL,NMDC,JINDALSTEL,NATIONALUM,HINDZINC,COALINDIA,"
+const string M_11 = ",RELIANCE,ONGC,BPCL,IOC,HINDPETRO,GAIL,PETRONET,OIL,IGL,"
+const string M_12 = ",NTPC,POWERGRID,TATAPOWER,ADANIGREEN,ADANIENSOL,NHPC,JSWENERGY,TORNTPOWER,"
+const string M_13 = ",LT,SIEMENS,ABB,BHEL,CGPOWER,CUMMINSIND,POLYCAB,BEL,HAL,BDL,"
+const string M_14 = ",ULTRACEMCO,GRASIM,SHREECEM,AMBUJACEM,DALBHARAT,"
+const string M_15 = ",DLF,GODREJPROP,OBEROIRLTY,LODHA,PRESTIGE,PHOENIXLTD,NBCC,"
+const string M_16 = ",ADANIENT,ADANIPORTS,GMRAIRPORT,CONCOR,IRCTC,INDIGO,"
+const string M_17 = ",BHARTIARTL,IDEA,INDUSTOWER,"
+const string M_18 = ",TITAN,DIXON,VOLTAS,CROMPTON,KALYANKJIL,HAVELLS,"
+const string M_19 = ",TRENT,DMART,ETERNAL,NYKAA,PAYTM,POLICYBZR,INDHOTEL,JUBLFOOD,"
+const string M_20 = ",PIIND,UPL,SRF,PIDILITIND,ASIANPAINT,"
+const string OI_01 = "NSE:HDFCBANK1!_OI*980+NSE:HDFCBANK2!_OI*980+NSE:ICICIBANK1!_OI*1400+NSE:ICICIBANK2!_OI*1400+NSE:AXISBANK1!_OI*1150+NSE:AXISBANK2!_OI*1150+NSE:KOTAKBANK1!_OI*2100+NSE:KOTAKBANK2!_OI*2100+NSE:INDUSINDBK1!_OI*800+NSE:INDUSINDBK2!_OI*800+NSE:FEDERALBNK1!_OI*210+NSE:FEDERALBNK2!_OI*210+NSE:IDFCFIRSTB1!_OI*75+NSE:IDFCFIRSTB2!_OI*75+NSE:AUBANK1!_OI*750+NSE:AUBANK2!_OI*750+NSE:BANDHANBNK1!_OI*165+NSE:BANDHANBNK2!_OI*165+NSE:YESBANK1!_OI*21+NSE:YESBANK2!_OI*21+NSE:RBLBANK1!_OI*280+NSE:RBLBANK2!_OI*280"
+const string OI_02 = "NSE:SBIN1!_OI*850+NSE:SBIN2!_OI*850+NSE:BANKBARODA1!_OI*250+NSE:BANKBARODA2!_OI*250+NSE:PNB1!_OI*110+NSE:PNB2!_OI*110+NSE:CANBK1!_OI*115+NSE:CANBK2!_OI*115+NSE:UNIONBANK1!_OI*140+NSE:UNIONBANK2!_OI*140+NSE:INDIANB1!_OI*650+NSE:INDIANB2!_OI*650+NSE:BANKINDIA1!_OI*120+NSE:BANKINDIA2!_OI*120"
+const string OI_03 = "NSE:BAJFINANCE1!_OI*950+NSE:BAJFINANCE2!_OI*950+NSE:BAJAJFINSV1!_OI*2000+NSE:BAJAJFINSV2!_OI*2000+NSE:SHRIRAMFIN1!_OI*650+NSE:SHRIRAMFIN2!_OI*650+NSE:CHOLAFIN1!_OI*1550+NSE:CHOLAFIN2!_OI*1550+NSE:MUTHOOTFIN1!_OI*2800+NSE:MUTHOOTFIN2!_OI*2800+NSE:MANAPPURAM1!_OI*270+NSE:MANAPPURAM2!_OI*270+NSE:LICHSGFIN1!_OI*600+NSE:LICHSGFIN2!_OI*600+NSE:SBICARD1!_OI*850+NSE:SBICARD2!_OI*850+NSE:LTF1!_OI*230+NSE:LTF2!_OI*230+NSE:M_MFIN1!_OI*270+NSE:M_MFIN2!_OI*270+NSE:ABCAPITAL1!_OI*270+NSE:ABCAPITAL2!_OI*270+NSE:POONAWALLA1!_OI*450+NSE:POONAWALLA2!_OI*450+NSE:PFC1!_OI*410+NSE:PFC2!_OI*410+NSE:RECLTD1!_OI*400+NSE:RECLTD2!_OI*400+NSE:JIOFIN1!_OI*310+NSE:JIOFIN2!_OI*310"
+const string OI_04 = "NSE:HDFCLIFE1!_OI*760+NSE:HDFCLIFE2!_OI*760+NSE:SBILIFE1!_OI*1850+NSE:SBILIFE2!_OI*1850+NSE:ICICIPRULI1!_OI*640+NSE:ICICIPRULI2!_OI*640+NSE:ICICIGI1!_OI*1950+NSE:ICICIGI2!_OI*1950+NSE:LICI1!_OI*900+NSE:LICI2!_OI*900+NSE:HDFCAMC1!_OI*2700+NSE:HDFCAMC2!_OI*2700+NSE:BSE1!_OI*2400+NSE:BSE2!_OI*2400+NSE:CDSL1!_OI*1600+NSE:CDSL2!_OI*1600+NSE:MCX1!_OI*8000+NSE:MCX2!_OI*8000+NSE:ANGELONE1!_OI*2500+NSE:ANGELONE2!_OI*2500+NSE:CAMS1!_OI*3900+NSE:CAMS2!_OI*3900"
+const string OI_05 = "NSE:TCS1!_OI*3100+NSE:TCS2!_OI*3100+NSE:INFY1!_OI*1500+NSE:INFY2!_OI*1500+NSE:HCLTECH1!_OI*1500+NSE:HCLTECH2!_OI*1500+NSE:WIPRO1!_OI*250+NSE:WIPRO2!_OI*250+NSE:TECHM1!_OI*1500+NSE:TECHM2!_OI*1500+NSE:LTIM1!_OI*5500+NSE:LTIM2!_OI*5500+NSE:MPHASIS1!_OI*2800+NSE:MPHASIS2!_OI*2800+NSE:COFORGE1!_OI*1800+NSE:COFORGE2!_OI*1800+NSE:PERSISTENT1!_OI*5600+NSE:PERSISTENT2!_OI*5600+NSE:OFSS1!_OI*8500+NSE:OFSS2!_OI*8500+NSE:KPITTECH1!_OI*1250+NSE:KPITTECH2!_OI*1250+NSE:TATAELXSI1!_OI*5500+NSE:TATAELXSI2!_OI*5500+NSE:LTTS1!_OI*4300+NSE:LTTS2!_OI*4300"
+const string OI_06 = "NSE:SUNPHARMA1!_OI*1650+NSE:SUNPHARMA2!_OI*1650+NSE:DRREDDY1!_OI*1250+NSE:DRREDDY2!_OI*1250+NSE:CIPLA1!_OI*1550+NSE:CIPLA2!_OI*1550+NSE:DIVISLAB1!_OI*6200+NSE:DIVISLAB2!_OI*6200+NSE:LUPIN1!_OI*2000+NSE:LUPIN2!_OI*2000+NSE:AUROPHARMA1!_OI*1150+NSE:AUROPHARMA2!_OI*1150+NSE:ZYDUSLIFE1!_OI*980+NSE:ZYDUSLIFE2!_OI*980+NSE:TORNTPHARM1!_OI*3500+NSE:TORNTPHARM2!_OI*3500+NSE:ALKEM1!_OI*5400+NSE:ALKEM2!_OI*5400+NSE:BIOCON1!_OI*370+NSE:BIOCON2!_OI*370+NSE:GLENMARK1!_OI*1900+NSE:GLENMARK2!_OI*1900+NSE:MANKIND1!_OI*2400+NSE:MANKIND2!_OI*2400+NSE:LAURUSLABS1!_OI*900+NSE:LAURUSLABS2!_OI*900+NSE:APOLLOHOSP1!_OI*7500+NSE:APOLLOHOSP2!_OI*7500+NSE:MAXHEALTH1!_OI*1150+NSE:MAXHEALTH2!_OI*1150+NSE:SYNGENE1!_OI*650+NSE:SYNGENE2!_OI*650"
+const string OI_07 = "NSE:MARUTI1!_OI*15000+NSE:MARUTI2!_OI*15000+NSE:M_M1!_OI*3500+NSE:M_M2!_OI*3500+NSE:TMPV1!_OI*400+NSE:TMPV2!_OI*400+NSE:BAJAJ_AUTO1!_OI*8800+NSE:BAJAJ_AUTO2!_OI*8800+NSE:EICHERMOT1!_OI*6900+NSE:EICHERMOT2!_OI*6900+NSE:HEROMOTOCO1!_OI*5300+NSE:HEROMOTOCO2!_OI*5300+NSE:TVSMOTOR1!_OI*3400+NSE:TVSMOTOR2!_OI*3400+NSE:ASHOKLEY1!_OI*140+NSE:ASHOKLEY2!_OI*140"
+const string OI_08 = "NSE:TIINDIA1!_OI*3000+NSE:TIINDIA2!_OI*3000+NSE:BHARATFORG1!_OI*1300+NSE:BHARATFORG2!_OI*1300+NSE:MOTHERSON1!_OI*100+NSE:MOTHERSON2!_OI*100+NSE:BOSCHLTD1!_OI*37000+NSE:BOSCHLTD2!_OI*37000+NSE:EXIDEIND1!_OI*390+NSE:EXIDEIND2!_OI*390+NSE:SONACOMS1!_OI*480+NSE:SONACOMS2!_OI*480"
+const string OI_09 = "NSE:HINDUNILVR1!_OI*2450+NSE:HINDUNILVR2!_OI*2450+NSE:ITC1!_OI*410+NSE:ITC2!_OI*410+NSE:NESTLEIND1!_OI*1230+NSE:NESTLEIND2!_OI*1230+NSE:BRITANNIA1!_OI*5900+NSE:BRITANNIA2!_OI*5900+NSE:DABUR1!_OI*510+NSE:DABUR2!_OI*510+NSE:GODREJCP1!_OI*1180+NSE:GODREJCP2!_OI*1180+NSE:MARICO1!_OI*720+NSE:MARICO2!_OI*720+NSE:COLPAL1!_OI*2200+NSE:COLPAL2!_OI*2200+NSE:TATACONSUM1!_OI*1150+NSE:TATACONSUM2!_OI*1150+NSE:UNITDSPR1!_OI*1400+NSE:UNITDSPR2!_OI*1400+NSE:VBL1!_OI*470+NSE:VBL2!_OI*470+NSE:PATANJALI1!_OI*590+NSE:PATANJALI2!_OI*590"
+const string OI_10 = "NSE:TATASTEEL1!_OI*170+NSE:TATASTEEL2!_OI*170+NSE:JSWSTEEL1!_OI*1150+NSE:JSWSTEEL2!_OI*1150+NSE:HINDALCO1!_OI*800+NSE:HINDALCO2!_OI*800+NSE:VEDL1!_OI*500+NSE:VEDL2!_OI*500+NSE:SAIL1!_OI*135+NSE:SAIL2!_OI*135+NSE:NMDC1!_OI*75+NSE:NMDC2!_OI*75+NSE:JINDALSTEL1!_OI*1000+NSE:JINDALSTEL2!_OI*1000+NSE:NATIONALUM1!_OI*230+NSE:NATIONALUM2!_OI*230+NSE:HINDZINC1!_OI*480+NSE:HINDZINC2!_OI*480+NSE:COALINDIA1!_OI*385+NSE:COALINDIA2!_OI*385"
+const string OI_11 = "NSE:RELIANCE1!_OI*1500+NSE:RELIANCE2!_OI*1500+NSE:ONGC1!_OI*245+NSE:ONGC2!_OI*245+NSE:BPCL1!_OI*360+NSE:BPCL2!_OI*360+NSE:IOC1!_OI*160+NSE:IOC2!_OI*160+NSE:HINDPETRO1!_OI*470+NSE:HINDPETRO2!_OI*470+NSE:GAIL1!_OI*180+NSE:GAIL2!_OI*180+NSE:PETRONET1!_OI*280+NSE:PETRONET2!_OI*280+NSE:OIL1!_OI*430+NSE:OIL2!_OI*430+NSE:IGL1!_OI*210+NSE:IGL2!_OI*210"
+const string OI_12 = "NSE:NTPC1!_OI*335+NSE:NTPC2!_OI*335+NSE:POWERGRID1!_OI*285+NSE:POWERGRID2!_OI*285+NSE:TATAPOWER1!_OI*390+NSE:TATAPOWER2!_OI*390+NSE:ADANIGREEN1!_OI*1000+NSE:ADANIGREEN2!_OI*1000+NSE:ADANIENSOL1!_OI*950+NSE:ADANIENSOL2!_OI*950+NSE:NHPC1!_OI*80+NSE:NHPC2!_OI*80+NSE:JSWENERGY1!_OI*520+NSE:JSWENERGY2!_OI*520+NSE:TORNTPOWER1!_OI*1300+NSE:TORNTPOWER2!_OI*1300"
+const string OI_13 = "NSE:LT1!_OI*3900+NSE:LT2!_OI*3900+NSE:SIEMENS1!_OI*3100+NSE:SIEMENS2!_OI*3100+NSE:ABB1!_OI*5200+NSE:ABB2!_OI*5200+NSE:BHEL1!_OI*250+NSE:BHEL2!_OI*250+NSE:CGPOWER1!_OI*700+NSE:CGPOWER2!_OI*700+NSE:CUMMINSIND1!_OI*4000+NSE:CUMMINSIND2!_OI*4000+NSE:POLYCAB1!_OI*7300+NSE:POLYCAB2!_OI*7300+NSE:BEL1!_OI*410+NSE:BEL2!_OI*410+NSE:HAL1!_OI*4600+NSE:HAL2!_OI*4600+NSE:BDL1!_OI*1600+NSE:BDL2!_OI*1600"
+const string OI_14 = "NSE:ULTRACEMCO1!_OI*12000+NSE:ULTRACEMCO2!_OI*12000+NSE:GRASIM1!_OI*2800+NSE:GRASIM2!_OI*2800+NSE:SHREECEM1!_OI*29000+NSE:SHREECEM2!_OI*29000+NSE:AMBUJACEM1!_OI*560+NSE:AMBUJACEM2!_OI*560+NSE:DALBHARAT1!_OI*2200+NSE:DALBHARAT2!_OI*2200"
+const string OI_15 = "NSE:DLF1!_OI*750+NSE:DLF2!_OI*750+NSE:GODREJPROP1!_OI*2200+NSE:GODREJPROP2!_OI*2200+NSE:OBEROIRLTY1!_OI*1700+NSE:OBEROIRLTY2!_OI*1700+NSE:LODHA1!_OI*1200+NSE:LODHA2!_OI*1200+NSE:PRESTIGE1!_OI*1650+NSE:PRESTIGE2!_OI*1650+NSE:PHOENIXLTD1!_OI*1700+NSE:PHOENIXLTD2!_OI*1700+NSE:NBCC1!_OI*115+NSE:NBCC2!_OI*115"
+const string OI_16 = "NSE:ADANIENT1!_OI*2400+NSE:ADANIENT2!_OI*2400+NSE:ADANIPORTS1!_OI*1450+NSE:ADANIPORTS2!_OI*1450+NSE:GMRAIRPORT1!_OI*90+NSE:GMRAIRPORT2!_OI*90+NSE:CONCOR1!_OI*560+NSE:CONCOR2!_OI*560+NSE:IRCTC1!_OI*720+NSE:IRCTC2!_OI*720+NSE:INDIGO1!_OI*5700+NSE:INDIGO2!_OI*5700"
+const string OI_17 = "NSE:BHARTIARTL1!_OI*2050+NSE:BHARTIARTL2!_OI*2050+NSE:IDEA1!_OI*9+NSE:IDEA2!_OI*9+NSE:INDUSTOWER1!_OI*390+NSE:INDUSTOWER2!_OI*390"
+const string OI_18 = "NSE:TITAN1!_OI*3700+NSE:TITAN2!_OI*3700+NSE:DIXON1!_OI*15000+NSE:DIXON2!_OI*15000+NSE:VOLTAS1!_OI*1350+NSE:VOLTAS2!_OI*1350+NSE:CROMPTON1!_OI*290+NSE:CROMPTON2!_OI*290+NSE:KALYANKJIL1!_OI*500+NSE:KALYANKJIL2!_OI*500+NSE:HAVELLS1!_OI*1500+NSE:HAVELLS2!_OI*1500"
+const string OI_19 = "NSE:TRENT1!_OI*4500+NSE:TRENT2!_OI*4500+NSE:DMART1!_OI*4100+NSE:DMART2!_OI*4100+NSE:ETERNAL1!_OI*310+NSE:ETERNAL2!_OI*310+NSE:NYKAA1!_OI*240+NSE:NYKAA2!_OI*240+NSE:PAYTM1!_OI*1250+NSE:PAYTM2!_OI*1250+NSE:POLICYBZR1!_OI*1800+NSE:POLICYBZR2!_OI*1800+NSE:INDHOTEL1!_OI*750+NSE:INDHOTEL2!_OI*750+NSE:JUBLFOOD1!_OI*620+NSE:JUBLFOOD2!_OI*620"
+const string OI_20 = "NSE:PIIND1!_OI*3600+NSE:PIIND2!_OI*3600+NSE:UPL1!_OI*700+NSE:UPL2!_OI*700+NSE:SRF1!_OI*2900+NSE:SRF2!_OI*2900+NSE:PIDILITIND1!_OI*1500+NSE:PIDILITIND2!_OI*1500+NSE:ASIANPAINT1!_OI*2500+NSE:ASIANPAINT2!_OI*2500"
+const string PX_01 = "NSE:HDFCBANK/980+NSE:ICICIBANK/1400+NSE:AXISBANK/1150+NSE:KOTAKBANK/2100+NSE:INDUSINDBK/800+NSE:FEDERALBNK/210+NSE:IDFCFIRSTB/75+NSE:AUBANK/750+NSE:BANDHANBNK/165+NSE:YESBANK/21+NSE:RBLBANK/280"
+const string PX_02 = "NSE:SBIN/850+NSE:BANKBARODA/250+NSE:PNB/110+NSE:CANBK/115+NSE:UNIONBANK/140+NSE:INDIANB/650+NSE:BANKINDIA/120"
+const string PX_03 = "NSE:BAJFINANCE/950+NSE:BAJAJFINSV/2000+NSE:SHRIRAMFIN/650+NSE:CHOLAFIN/1550+NSE:MUTHOOTFIN/2800+NSE:MANAPPURAM/270+NSE:LICHSGFIN/600+NSE:SBICARD/850+NSE:LTF/230+NSE:M_MFIN/270+NSE:ABCAPITAL/270+NSE:POONAWALLA/450+NSE:PFC/410+NSE:RECLTD/400+NSE:JIOFIN/310"
+const string PX_04 = "NSE:HDFCLIFE/760+NSE:SBILIFE/1850+NSE:ICICIPRULI/640+NSE:ICICIGI/1950+NSE:LICI/900+NSE:HDFCAMC/2700+NSE:BSE/2400+NSE:CDSL/1600+NSE:MCX/8000+NSE:ANGELONE/2500+NSE:CAMS/3900"
+const string PX_05 = "NSE:TCS/3100+NSE:INFY/1500+NSE:HCLTECH/1500+NSE:WIPRO/250+NSE:TECHM/1500+NSE:LTIM/5500+NSE:MPHASIS/2800+NSE:COFORGE/1800+NSE:PERSISTENT/5600+NSE:OFSS/8500+NSE:KPITTECH/1250+NSE:TATAELXSI/5500+NSE:LTTS/4300"
+const string PX_06 = "NSE:SUNPHARMA/1650+NSE:DRREDDY/1250+NSE:CIPLA/1550+NSE:DIVISLAB/6200+NSE:LUPIN/2000+NSE:AUROPHARMA/1150+NSE:ZYDUSLIFE/980+NSE:TORNTPHARM/3500+NSE:ALKEM/5400+NSE:BIOCON/370+NSE:GLENMARK/1900+NSE:MANKIND/2400+NSE:LAURUSLABS/900+NSE:APOLLOHOSP/7500+NSE:MAXHEALTH/1150+NSE:SYNGENE/650"
+const string PX_07 = "NSE:MARUTI/15000+NSE:M_M/3500+NSE:TMPV/400+NSE:BAJAJ_AUTO/8800+NSE:EICHERMOT/6900+NSE:HEROMOTOCO/5300+NSE:TVSMOTOR/3400+NSE:ASHOKLEY/140"
+const string PX_08 = "NSE:TIINDIA/3000+NSE:BHARATFORG/1300+NSE:MOTHERSON/100+NSE:BOSCHLTD/37000+NSE:EXIDEIND/390+NSE:SONACOMS/480"
+const string PX_09 = "NSE:HINDUNILVR/2450+NSE:ITC/410+NSE:NESTLEIND/1230+NSE:BRITANNIA/5900+NSE:DABUR/510+NSE:GODREJCP/1180+NSE:MARICO/720+NSE:COLPAL/2200+NSE:TATACONSUM/1150+NSE:UNITDSPR/1400+NSE:VBL/470+NSE:PATANJALI/590"
+const string PX_10 = "NSE:TATASTEEL/170+NSE:JSWSTEEL/1150+NSE:HINDALCO/800+NSE:VEDL/500+NSE:SAIL/135+NSE:NMDC/75+NSE:JINDALSTEL/1000+NSE:NATIONALUM/230+NSE:HINDZINC/480+NSE:COALINDIA/385"
+const string PX_11 = "NSE:RELIANCE/1500+NSE:ONGC/245+NSE:BPCL/360+NSE:IOC/160+NSE:HINDPETRO/470+NSE:GAIL/180+NSE:PETRONET/280+NSE:OIL/430+NSE:IGL/210"
+const string PX_12 = "NSE:NTPC/335+NSE:POWERGRID/285+NSE:TATAPOWER/390+NSE:ADANIGREEN/1000+NSE:ADANIENSOL/950+NSE:NHPC/80+NSE:JSWENERGY/520+NSE:TORNTPOWER/1300"
+const string PX_13 = "NSE:LT/3900+NSE:SIEMENS/3100+NSE:ABB/5200+NSE:BHEL/250+NSE:CGPOWER/700+NSE:CUMMINSIND/4000+NSE:POLYCAB/7300+NSE:BEL/410+NSE:HAL/4600+NSE:BDL/1600"
+const string PX_14 = "NSE:ULTRACEMCO/12000+NSE:GRASIM/2800+NSE:SHREECEM/29000+NSE:AMBUJACEM/560+NSE:DALBHARAT/2200"
+const string PX_15 = "NSE:DLF/750+NSE:GODREJPROP/2200+NSE:OBEROIRLTY/1700+NSE:LODHA/1200+NSE:PRESTIGE/1650+NSE:PHOENIXLTD/1700+NSE:NBCC/115"
+const string PX_16 = "NSE:ADANIENT/2400+NSE:ADANIPORTS/1450+NSE:GMRAIRPORT/90+NSE:CONCOR/560+NSE:IRCTC/720+NSE:INDIGO/5700"
+const string PX_17 = "NSE:BHARTIARTL/2050+NSE:IDEA/9+NSE:INDUSTOWER/390"
+const string PX_18 = "NSE:TITAN/3700+NSE:DIXON/15000+NSE:VOLTAS/1350+NSE:CROMPTON/290+NSE:KALYANKJIL/500+NSE:HAVELLS/1500"
+const string PX_19 = "NSE:TRENT/4500+NSE:DMART/4100+NSE:ETERNAL/310+NSE:NYKAA/240+NSE:PAYTM/1250+NSE:POLICYBZR/1800+NSE:INDHOTEL/750+NSE:JUBLFOOD/620"
+const string PX_20 = "NSE:PIIND/3600+NSE:UPL/700+NSE:SRF/2900+NSE:PIDILITIND/1500+NSE:ASIANPAINT/2500"
+f_secOf(string tk) =>
+    string w = "," + tk + ","
+    str.contains(M_01, w) ? 1 : str.contains(M_02, w) ? 2 : str.contains(M_03, w) ? 3 : str.contains(M_04, w) ? 4 : str.contains(M_05, w) ? 5 : str.contains(M_06, w) ? 6 : str.contains(M_07, w) ? 7 : str.contains(M_08, w) ? 8 : str.contains(M_09, w) ? 9 : str.contains(M_10, w) ? 10 : str.contains(M_11, w) ? 11 : str.contains(M_12, w) ? 12 : str.contains(M_13, w) ? 13 : str.contains(M_14, w) ? 14 : str.contains(M_15, w) ? 15 : str.contains(M_16, w) ? 16 : str.contains(M_17, w) ? 17 : str.contains(M_18, w) ? 18 : str.contains(M_19, w) ? 19 : str.contains(M_20, w) ? 20 : 0
+f_oiF(int s) =>
+    s == 1 ? OI_01 : s == 2 ? OI_02 : s == 3 ? OI_03 : s == 4 ? OI_04 : s == 5 ? OI_05 : s == 6 ? OI_06 : s == 7 ? OI_07 : s == 8 ? OI_08 : s == 9 ? OI_09 : s == 10 ? OI_10 : s == 11 ? OI_11 : s == 12 ? OI_12 : s == 13 ? OI_13 : s == 14 ? OI_14 : s == 15 ? OI_15 : s == 16 ? OI_16 : s == 17 ? OI_17 : s == 18 ? OI_18 : s == 19 ? OI_19 : s == 20 ? OI_20 : NOSYM
+f_pxF(int s) =>
+    s == 1 ? PX_01 : s == 2 ? PX_02 : s == 3 ? PX_03 : s == 4 ? PX_04 : s == 5 ? PX_05 : s == 6 ? PX_06 : s == 7 ? PX_07 : s == 8 ? PX_08 : s == 9 ? PX_09 : s == 10 ? PX_10 : s == 11 ? PX_11 : s == 12 ? PX_12 : s == 13 ? PX_13 : s == 14 ? PX_14 : s == 15 ? PX_15 : s == 16 ? PX_16 : s == 17 ? PX_17 : s == 18 ? PX_18 : s == 19 ? PX_19 : s == 20 ? PX_20 : NOSYM
+f_memF(int s) =>
+    s == 1 ? M_01 : s == 2 ? M_02 : s == 3 ? M_03 : s == 4 ? M_04 : s == 5 ? M_05 : s == 6 ? M_06 : s == 7 ? M_07 : s == 8 ? M_08 : s == 9 ? M_09 : s == 10 ? M_10 : s == 11 ? M_11 : s == 12 ? M_12 : s == 13 ? M_13 : s == 14 ? M_14 : s == 15 ? M_15 : s == 16 ? M_16 : s == 17 ? M_17 : s == 18 ? M_18 : s == 19 ? M_19 : s == 20 ? M_20 : ""
+const int SEC_N = 20
+// ── END SECTOR TABLE ──
+
+// ─────────────────────────────── UTILITIES ───────────────────────────────
+f_ymd(int t) => year(t, TZ) * 10000 + month(t, TZ) * 100 + dayofmonth(t, TZ)
+f_min(int t) => hour(t, TZ) * 60 + minute(t, TZ)
+f_pct(float x, float base) => na(x) or na(base) or base == 0 ? na : 100.0 * (x - base) / math.abs(base)
+// Reading: +2 long build-up · +1 short covering · 0 neutral · −1 long unwinding · −2 short build-up
+f_bias(float px, float oi, float pb, float ob) =>
+    na(px) or na(oi) ? na : math.abs(px) < pb or math.abs(oi) < ob ? 0.0 : (px > 0 ? 1.0 : -1.0) * (oi > 0 ? 2.0 : 1.0)
+
+// Relative volume, cumulative: volume from 09:15 to this candle ÷ the average volume from 09:15 to the same time
+// on the last rvDays earlier days. One column per day (a ring), one row per candle slot of the day.
+// Works in whichever context it runs: the chart (the stock) or inside a request (the sector formula).
+f_rv(float v) =>
+    var matrix<float> M = matrix.new<float>(MAXSLOT, rvDays + 1, na)
+    var int   col  = 0
+    var float cum  = 0.0
+    var int   dKey = na
+    int   mins = f_min(time)
+    float out  = na
+    if mins >= 555 and mins < 930
+        int k = f_ymd(time)
+        if na(dKey) or k != dKey
+            dKey := k
+            col  := (col + 1) % (rvDays + 1)
+            for r = 0 to MAXSLOT - 1
+                M.set(r, col, na)
+            cum := 0.0
+        cum += nz(v)
+        int slot = math.min(MAXSLOT - 1, math.floor((mins - 555) / TF_MIN))
+        M.set(slot, col, cum)
+        float s = 0.0
+        int   c = 0
+        for j = 0 to rvDays
+            if j != col
+                float x = M.get(slot, j)
+                if not na(x)
+                    s += x
+                    c += 1
+        out := c >= rvMin and s > 0 and cum > 0 ? 100.0 * cum / (s / c) : na
+    out
+
+// Inside a requested symbol: this candle, the previous day's last close, today's first open, relative volume,
+// and the close nBack candles ago today (na when fewer have passed today)
+f_dayReq(int nBack) =>
+    var float eod  = na
+    var int   eodT = na
+    var float dOp  = na
+    var array<float> dc = array.new_float()
+    if not na(time[1]) and f_ymd(time) != f_ymd(time[1])
+        eod  := close[1]
+        eodT := time[1]
+        dOp  := open
+        dc.clear()
+    dc.push(close)
+    float back = dc.size() > nBack ? dc.get(dc.size() - 1 - nBack) : na
+    float rv   = f_rv(volume)
+    [time, close, eod, eodT, dOp, rv, back]
+
+// Inside a futures OI series: this candle, the one before it, and the previous day's last OI (as FCOI Screener)
+f_oiReq() =>
+    var float eod  = na
+    var int   eodT = na
+    if not na(time[1]) and f_ymd(time) != f_ymd(time[1])
+        eod  := close[1]
+        eodT := time[1]
+    [time, close, eod, eodT]
+
+// ─────────────────────────────── DATA REQUESTS (5) ───────────────────────────────
+string EXCH  = syminfo.prefix == "BSE" ? "NSE" : syminfo.prefix
+string FUT1  = EXCH + ":" + syminfo.ticker + "1!"
+string FUT2  = EXCH + ":" + syminfo.ticker + "2!"
+int    SEC   = f_secOf(syminfo.ticker)
+bool   SECQ  = secOn and SEC > 0
+string F_OI  = SECQ ? f_oiF(SEC) : NOSYM
+string F_PX  = SECQ ? f_pxF(SEC) : NOSYM
+bool   LEAD  = str.contains(LEADERS, "," + syminfo.ticker + ",")
+
+[n1T, n1C, n1E, n1ET] = request.security(FUT1 + "_OI", timeframe.period, f_oiReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[n2T, n2C, n2E, n2ET] = request.security(FUT2 + "_OI", timeframe.period, f_oiReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[sT, sC, sE, sET, sO, sRvX, sB] = request.security(F_OI, timeframe.period, f_dayReq(lastN), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[pT, pC, pE, pET, pO, pRv, pB]  = request.security(F_PX, timeframe.period, f_dayReq(lastN), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[xT, xC, xE, xET, xO, xRv, xB]  = request.security("NSE:NIFTY", timeframe.period, f_dayReq(lastN), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+// The stock's own relative volume, every candle (read below only from closed candles)
+float rvNow = f_rv(volume)
+
+// ─────────────────────────────── CANDLE AND DAY ───────────────────────────────
+// A candle counts only once it has closed. The time test also guards the screener's last candle while it forms.
+bool closed = barstate.isconfirmed and (barstate.isrealtime or na(timenow) or time_close <= timenow)
+int  bD0    = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 9, 15, 0)
+bool inDay  = time >= bD0 and time < timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 15, 30, 0)
+bool cBar   = closed and inDay
+var int dayKey = na
+bool newDay = cBar and (na(dayKey) or bD0 != dayKey)
+
+// ─────────────────────────────── STATE ───────────────────────────────
+var float dClose  = na                     // the day in progress: latest close
+var int   dLastT  = na
+var float pdClose = na                     // the previous day's last close
+var int   pvYmd   = na                     // the previous day's date
+// The stock's futures: today's base (the previous day's last prints) and today's latest prints
+var bool  stOI  = false
+var float sP1   = na
+var float sP2   = na
+var bool  sRoll = false                    // 1! and 2! switched contracts overnight
+var float c1    = na
+var float c2    = na
+var array<float> dayOI = array.new_float() // today's OI measure at each closed candle
+// The sector formulas and Nifty: today's latest closed-candle values
+var float kOI  = na
+var float kOIE = na
+var int kOIET = na
+var float kOIO = na
+var float kOIB = na
+var float kPx  = na
+var float kPxE = na
+var int kPxET = na
+var float kPRv = na
+var float kN   = na
+var float kNE  = na
+var int kNET  = na
+// The columns, as at the latest closed candle
+var float tPx   = na
+var float tOIp = na
+var float tOIcr = na
+var float tOIn = na
+var float tRv = na
+var float tSOIp = na
+var float tSOIcr = na
+var float tSOIn = na
+var float tSPx = na
+var float tSRv = na
+var float tNx   = na
+var bool  tRoll = false
+
+// ─────────────────────────────── A NEW DAY ───────────────────────────────
+if newDay
+    pdClose := dClose
+    pvYmd   := na(dLastT) ? na : f_ymd(dLastT)
+    dayKey  := bD0
+    stOI    := false
+    sP1     := na
+    sP2     := na
+    sRoll   := false
+    c1      := na
+    c2      := na
+    dayOI.clear()
+    kOI  := na
+    kOIE := na
+    kOIET := na
+    kOIO := na
+    kOIB := na
+    kPx  := na
+    kPxE := na
+    kPxET := na
+    kPRv := na
+    kN   := na
+    kNE  := na
+    kNET  := na
+
+// ─────────────────────────────── EVERY CLOSED CANDLE OF THE DAY ───────────────────────────────
+if cBar
+    int today = f_ymd(time)
+    // Today's base: the previous day's last OI prints, from the first candle where both futures series have data
+    if not stOI and not na(pvYmd) and not na(n1T) and n1T == time and not na(n2T) and n2T == time and not na(n1ET) and not na(n2ET) and f_ymd(n1ET) == pvYmd and f_ymd(n2ET) == pvYmd and n1E > 0 and n2E > 0 and n1C > 0
+        stOI  := true
+        sP1   := n1E
+        sP2   := n2E
+        sRoll := math.abs(n1C - n2E) < math.abs(n1C - n1E)   // today's near month looks like yesterday's next month
+    // Today's latest futures prints (a futures candle at this exact time; otherwise the last one today stays)
+    if not na(n1T) and n1T == time and n1C > 0
+        c1 := n1C
+    if not na(n2T) and n2T == time and n2C > 0
+        c2 := n2C
+    // The stock's OI measure: near + next; on a roll morning the one contract both days share
+    float base = stOI ? (sRoll ? sP2 : sP1 + sP2) : na
+    float m    = stOI ? (sRoll ? c1 : c1 + c2) : na
+    if not na(m)
+        dayOI.push(m)
+    // Sector formulas and Nifty: this candle's values, when their candle starts with this one
+    if not na(sT) and sT == time and sC > 0
+        kOI   := sC
+        kOIE  := sE
+        kOIET := sET
+        kOIO  := sO
+        kOIB  := sB
+    if not na(pT) and pT == time and pC > 0
+        kPx   := pC
+        kPxE  := pE
+        kPxET := pET
+        kPRv  := pRv
+    if not na(xT) and xT == time and xC > 0
+        kN    := xC
+        kNE   := xE
+        kNET  := xET
+    // ── The stock ──
+    tPx   := f_pct(close, pdClose)
+    tOIp  := f_pct(m, base)
+    tOIcr := na(m) or na(base) ? na : (m - base) * close / 1e7
+    tOIn  := na(m) or na(base) or base == 0 ? na : 100.0 * (m - (dayOI.size() > lastN ? dayOI.get(dayOI.size() - 1 - lastN) : base)) / base
+    tRv   := rvNow
+    // ── The sector OI formula: base = the previous day's last print; on a roll morning, today's first print ──
+    bool  sOk   = not na(kOI) and not na(kOIET) and f_ymd(kOIET) < today and kOIE > 0
+    bool  rollS = sRoll or (sOk and not na(kOIO) and math.abs(kOIO - kOIE) / kOIE > ROLL_TOL)
+    float sBase = sOk ? (rollS ? kOIO : kOIE) : na
+    tRoll  := sRoll or rollS
+    tSOIp  := f_pct(kOI, sBase)
+    tSOIcr := na(kOI) or na(sBase) ? na : (kOI - sBase) / 1e7
+    tSOIn  := na(kOI) or na(sBase) or sBase == 0 ? na : 100.0 * (kOI - (na(kOIB) ? sBase : kOIB)) / sBase
+    // ── The sector price formula and Nifty ──
+    bool pOk = not na(kPx) and not na(kPxET) and f_ymd(kPxET) < today
+    tSPx := pOk ? f_pct(kPx, kPxE) : na
+    tSRv := pOk ? kPRv : na
+    bool nOk = not na(kN) and not na(kNET) and f_ymd(kNET) < today
+    tNx  := nOk ? f_pct(kN, kNE) : na
+    dClose := close
+    dLastT := time
+
+// ─────────────────────────────── READINGS AND THE GROUP KEY ───────────────────────────────
+float bias  = f_bias(tPx, tOIp, pxBand, oiBand)
+float sBias = f_bias(tSPx, tSOIp, sPxBand, sOiBand)
+
+float secM = keySec == "Sector OI %" ? tSOIp * 100 : keySec == "Sector OI ₹ cr" ? tSOIcr : keySec == "Sector price %" ? tSPx * 100 : keySec == "Sector RVOL %" ? tSRv : 0.0
+float stkM = keyStk == "OI %" ? tOIp * 10 : keyStk == "OI ₹ cr" ? tOIcr : keyStk == "Price %" ? tPx * 10 : tRv
+float major = na(secM) ? -49999.0 : math.max(-49998.0, math.min(49999.0, math.round(secM)))
+float minor = na(stkM) ? -4999.0 : math.max(-4999.0, math.min(4999.0, math.round(stkM)))
+// Major part: the sector's ranking value (the same for every stock of a sector, so they stay together);
+// middle: the sector code (keeps two sectors with the same value apart); minor: the stock's ranking value.
+float gKey = SEC == 0 ? na : major * 1e6 + SEC * 1e4 + (5000 + minor)
+
+int dataCd = SEC == 0 ? 3 : not secOn ? 5 : na(tSOIp) ? 4 : na(tOIp) ? 2 : tRoll ? 1 : 0
+
+// ─────────────────────────────── SCREENER COLUMNS ───────────────────────────────
+// Not drawn on the chart: the values appear in the Pine Screener (and in a chart's data window).
+plot(bias, "Bias", #7E57C2, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(tPx, "Price %", #2962FF, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tOIp, "OI %", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tOIcr, "OI ₹ cr", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(tRv, "RVOL %", #FF9800, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(SEC, "Sector", #787B86, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(tSOIp, "Sec OI %", #00897B, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tSPx, "Sec price %", #1E88E5, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tSRv, "Sec RVOL %", #FB8C00, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(gKey, "Group key", #9E9E9E, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(sBias, "Sec bias", #7E57C2, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(tSOIcr, "Sec OI ₹ cr", #00897B, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(tOIn, "OI % last N", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tSOIn, "Sec OI % last N", #00897B, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(na(tPx) or na(tSPx) ? na : tPx - tSPx, "vs Sector %", #1E88E5, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tNx, "Nifty %", #5C6BC0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(na(tPx) or na(tNx) ? na : tPx - tNx, "vs Nifty %", #5C6BC0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(LEAD ? 1 : 0, "Sector row", #9E9E9E, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+plot(dataCd, "Data", #9E9E9E, display=display.all - display.pane - display.price_scale - display.status_line, precision=0)
+
+// ─────────────────────────────── FILTER PRESETS (alert conditions) ───────────────────────────────
+bool hiRv = not na(tRv) and tRv >= rvHi
+alertcondition(bias == 2 and hiRv, "Long build-up + high RVOL", "{{ticker}}: long build-up with high relative volume")
+alertcondition(bias == -2 and hiRv, "Short build-up + high RVOL", "{{ticker}}: short build-up with high relative volume")
+alertcondition(bias == 1 and hiRv, "Short covering + high RVOL", "{{ticker}}: short covering with high relative volume")
+alertcondition(not na(tOIp) and tOIp <= -oiBand and not na(tRv) and tRv < rvHi, "Quiet OI decline", "{{ticker}}: OI falling without high relative volume")
+alertcondition(not na(bias) and not na(sBias) and bias * sBias < 0, "Against its sector", "{{ticker}}: reading points the opposite way to its sector")
+alertcondition(not na(tSOIp) and tSOIp >= sOiBand, "Sector adding OI", "{{ticker}}: its sector is adding OI")
+
+// ─────────────────────────────── CHART TABLE (checking only) ───────────────────────────────
+f_s(float x, int d) => na(x) ? "—" : str.tostring(x, d == 0 ? "#,##0" : d == 1 ? "#,##0.0" : "#,##0.00")
+f_bTxt(float b) => na(b) ? "—" : b == 2 ? "+2 long build-up" : b == 1 ? "+1 short covering" : b == -1 ? "−1 long unwinding" : b == -2 ? "−2 short build-up" : "0 neutral"
+var table T = table.new(position.top_right, 2, 21, bgcolor=color.new(#131722, 0), border_color=color.new(#787B86, 60), border_width=1, frame_color=#787B86, frame_width=1)
+f_row(int r, string a, string b, color c) =>
+    table.cell(T, 0, r, a, text_color=#B2B5BE, text_halign=text.align_left, text_size=size.small)
+    table.cell(T, 1, r, b, text_color=c, text_halign=text.align_right, text_size=size.small)
+f_col(float x) => na(x) ? #787B86 : x > 0 ? #26A69A : x < 0 ? #EF5350 : #B2B5BE
+if barstate.islast and tblOn
+    string secName = str.split(SEC_NAMES, "|").get(SEC)
+    f_row(0,  "FOSS 1.00 · " + syminfo.ticker, secName, #D1D4DC)
+    f_row(1,  "Bias", f_bTxt(bias), f_col(bias))
+    f_row(2,  "Price %", f_s(tPx, 2), f_col(tPx))
+    f_row(3,  "OI %", f_s(tOIp, 2), f_col(tOIp))
+    f_row(4,  "OI ₹ cr", f_s(tOIcr, 1), f_col(tOIcr))
+    f_row(5,  "RVOL %", f_s(tRv, 0), na(tRv) ? #787B86 : tRv >= rvHi ? #FF9800 : #B2B5BE)
+    f_row(6,  "OI % last " + str.tostring(lastN), f_s(tOIn, 2), f_col(tOIn))
+    f_row(7,  "Sector", str.tostring(SEC) + (LEAD ? " (sector row)" : ""), #D1D4DC)
+    f_row(8,  "Sec bias", f_bTxt(sBias), f_col(sBias))
+    f_row(9,  "Sec OI %", f_s(tSOIp, 2), f_col(tSOIp))
+    f_row(10, "Sec OI ₹ cr", f_s(tSOIcr, 0), f_col(tSOIcr))
+    f_row(11, "Sec OI % last " + str.tostring(lastN), f_s(tSOIn, 2), f_col(tSOIn))
+    f_row(12, "Sec price %", f_s(tSPx, 2), f_col(tSPx))
+    f_row(13, "Sec RVOL %", f_s(tSRv, 0), na(tSRv) ? #787B86 : tSRv >= rvHi ? #FF9800 : #B2B5BE)
+    f_row(14, "vs Sector %", f_s(na(tPx) or na(tSPx) ? na : tPx - tSPx, 2), f_col(na(tPx) or na(tSPx) ? na : tPx - tSPx))
+    f_row(15, "Nifty %", f_s(tNx, 2), f_col(tNx))
+    f_row(16, "vs Nifty %", f_s(na(tPx) or na(tNx) ? na : tPx - tNx, 2), f_col(na(tPx) or na(tNx) ? na : tPx - tNx))
+    f_row(17, "Group key", f_s(gKey, 0), #B2B5BE)
+    f_row(18, "Data", str.tostring(dataCd) + (dataCd == 0 ? " all good" : dataCd == 1 ? " roll morning" : dataCd == 2 ? " stock OI missing" : dataCd == 3 ? " not in sector table" : dataCd == 4 ? " sector formula empty" : " sector columns off"), dataCd == 0 ? #26A69A : #FF9800)

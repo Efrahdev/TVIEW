@@ -1,0 +1,177 @@
+sector_code,sector,ticker,ref_price
+1,Private Banks,HDFCBANK,980
+1,Private Banks,ICICIBANK,1400
+1,Private Banks,AXISBANK,1150
+1,Private Banks,KOTAKBANK,2100
+1,Private Banks,INDUSINDBK,800
+1,Private Banks,FEDERALBNK,210
+1,Private Banks,IDFCFIRSTB,75
+1,Private Banks,AUBANK,750
+1,Private Banks,BANDHANBNK,165
+1,Private Banks,YESBANK,21
+1,Private Banks,RBLBANK,280
+2,PSU Banks,SBIN,850
+2,PSU Banks,BANKBARODA,250
+2,PSU Banks,PNB,110
+2,PSU Banks,CANBK,115
+2,PSU Banks,UNIONBANK,140
+2,PSU Banks,INDIANB,650
+2,PSU Banks,BANKINDIA,120
+3,NBFC and Lending,BAJFINANCE,950
+3,NBFC and Lending,BAJAJFINSV,2000
+3,NBFC and Lending,SHRIRAMFIN,650
+3,NBFC and Lending,CHOLAFIN,1550
+3,NBFC and Lending,MUTHOOTFIN,2800
+3,NBFC and Lending,MANAPPURAM,270
+3,NBFC and Lending,LICHSGFIN,600
+3,NBFC and Lending,SBICARD,850
+3,NBFC and Lending,LTF,230
+3,NBFC and Lending,M_MFIN,270
+3,NBFC and Lending,ABCAPITAL,270
+3,NBFC and Lending,POONAWALLA,450
+3,NBFC and Lending,PFC,410
+3,NBFC and Lending,RECLTD,400
+3,NBFC and Lending,JIOFIN,310
+4,Capital Markets and Insurance,HDFCLIFE,760
+4,Capital Markets and Insurance,SBILIFE,1850
+4,Capital Markets and Insurance,ICICIPRULI,640
+4,Capital Markets and Insurance,ICICIGI,1950
+4,Capital Markets and Insurance,LICI,900
+4,Capital Markets and Insurance,HDFCAMC,2700
+4,Capital Markets and Insurance,BSE,2400
+4,Capital Markets and Insurance,CDSL,1600
+4,Capital Markets and Insurance,MCX,8000
+4,Capital Markets and Insurance,ANGELONE,2500
+4,Capital Markets and Insurance,CAMS,3900
+5,IT,TCS,3100
+5,IT,INFY,1500
+5,IT,HCLTECH,1500
+5,IT,WIPRO,250
+5,IT,TECHM,1500
+5,IT,LTIM,5500
+5,IT,MPHASIS,2800
+5,IT,COFORGE,1800
+5,IT,PERSISTENT,5600
+5,IT,OFSS,8500
+5,IT,KPITTECH,1250
+5,IT,TATAELXSI,5500
+5,IT,LTTS,4300
+6,Pharma and Healthcare,SUNPHARMA,1650
+6,Pharma and Healthcare,DRREDDY,1250
+6,Pharma and Healthcare,CIPLA,1550
+6,Pharma and Healthcare,DIVISLAB,6200
+6,Pharma and Healthcare,LUPIN,2000
+6,Pharma and Healthcare,AUROPHARMA,1150
+6,Pharma and Healthcare,ZYDUSLIFE,980
+6,Pharma and Healthcare,TORNTPHARM,3500
+6,Pharma and Healthcare,ALKEM,5400
+6,Pharma and Healthcare,BIOCON,370
+6,Pharma and Healthcare,GLENMARK,1900
+6,Pharma and Healthcare,MANKIND,2400
+6,Pharma and Healthcare,LAURUSLABS,900
+6,Pharma and Healthcare,APOLLOHOSP,7500
+6,Pharma and Healthcare,MAXHEALTH,1150
+6,Pharma and Healthcare,SYNGENE,650
+7,Auto OEM,MARUTI,15000
+7,Auto OEM,M_M,3500
+7,Auto OEM,TMPV,400
+7,Auto OEM,BAJAJ_AUTO,8800
+7,Auto OEM,EICHERMOT,6900
+7,Auto OEM,HEROMOTOCO,5300
+7,Auto OEM,TVSMOTOR,3400
+7,Auto OEM,ASHOKLEY,140
+8,Auto Components,TIINDIA,3000
+8,Auto Components,BHARATFORG,1300
+8,Auto Components,MOTHERSON,100
+8,Auto Components,BOSCHLTD,37000
+8,Auto Components,EXIDEIND,390
+8,Auto Components,SONACOMS,480
+9,FMCG,HINDUNILVR,2450
+9,FMCG,ITC,410
+9,FMCG,NESTLEIND,1230
+9,FMCG,BRITANNIA,5900
+9,FMCG,DABUR,510
+9,FMCG,GODREJCP,1180
+9,FMCG,MARICO,720
+9,FMCG,COLPAL,2200
+9,FMCG,TATACONSUM,1150
+9,FMCG,UNITDSPR,1400
+9,FMCG,VBL,470
+9,FMCG,PATANJALI,590
+10,Metals and Mining,TATASTEEL,170
+10,Metals and Mining,JSWSTEEL,1150
+10,Metals and Mining,HINDALCO,800
+10,Metals and Mining,VEDL,500
+10,Metals and Mining,SAIL,135
+10,Metals and Mining,NMDC,75
+10,Metals and Mining,JINDALSTEL,1000
+10,Metals and Mining,NATIONALUM,230
+10,Metals and Mining,HINDZINC,480
+10,Metals and Mining,COALINDIA,385
+11,Oil and Gas,RELIANCE,1500
+11,Oil and Gas,ONGC,245
+11,Oil and Gas,BPCL,360
+11,Oil and Gas,IOC,160
+11,Oil and Gas,HINDPETRO,470
+11,Oil and Gas,GAIL,180
+11,Oil and Gas,PETRONET,280
+11,Oil and Gas,OIL,430
+11,Oil and Gas,IGL,210
+12,Power,NTPC,335
+12,Power,POWERGRID,285
+12,Power,TATAPOWER,390
+12,Power,ADANIGREEN,1000
+12,Power,ADANIENSOL,950
+12,Power,NHPC,80
+12,Power,JSWENERGY,520
+12,Power,TORNTPOWER,1300
+13,Capital Goods and Defence,LT,3900
+13,Capital Goods and Defence,SIEMENS,3100
+13,Capital Goods and Defence,ABB,5200
+13,Capital Goods and Defence,BHEL,250
+13,Capital Goods and Defence,CGPOWER,700
+13,Capital Goods and Defence,CUMMINSIND,4000
+13,Capital Goods and Defence,POLYCAB,7300
+13,Capital Goods and Defence,BEL,410
+13,Capital Goods and Defence,HAL,4600
+13,Capital Goods and Defence,BDL,1600
+14,Cement,ULTRACEMCO,12000
+14,Cement,GRASIM,2800
+14,Cement,SHREECEM,29000
+14,Cement,AMBUJACEM,560
+14,Cement,DALBHARAT,2200
+15,Realty,DLF,750
+15,Realty,GODREJPROP,2200
+15,Realty,OBEROIRLTY,1700
+15,Realty,LODHA,1200
+15,Realty,PRESTIGE,1650
+15,Realty,PHOENIXLTD,1700
+15,Realty,NBCC,115
+16,Infra and Logistics,ADANIENT,2400
+16,Infra and Logistics,ADANIPORTS,1450
+16,Infra and Logistics,GMRAIRPORT,90
+16,Infra and Logistics,CONCOR,560
+16,Infra and Logistics,IRCTC,720
+16,Infra and Logistics,INDIGO,5700
+17,Telecom,BHARTIARTL,2050
+17,Telecom,IDEA,9
+17,Telecom,INDUSTOWER,390
+18,Consumer Durables,TITAN,3700
+18,Consumer Durables,DIXON,15000
+18,Consumer Durables,VOLTAS,1350
+18,Consumer Durables,CROMPTON,290
+18,Consumer Durables,KALYANKJIL,500
+18,Consumer Durables,HAVELLS,1500
+19,Consumer Services,TRENT,4500
+19,Consumer Services,DMART,4100
+19,Consumer Services,ETERNAL,310
+19,Consumer Services,NYKAA,240
+19,Consumer Services,PAYTM,1250
+19,Consumer Services,POLICYBZR,1800
+19,Consumer Services,INDHOTEL,750
+19,Consumer Services,JUBLFOOD,620
+20,Chemicals and Paints,PIIND,3600
+20,Chemicals and Paints,UPL,700
+20,Chemicals and Paints,SRF,2900
+20,Chemicals and Paints,PIDILITIND,1500
+20,Chemicals and Paints,ASIANPAINT,2500

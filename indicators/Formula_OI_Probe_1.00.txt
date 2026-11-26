@@ -1,0 +1,92 @@
+//@version=6
+indicator("Formula OI Probe 1.00", "FOP", overlay=false)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FORMULA OI PROBE 1.00 — a one-off test, not a trading tool.
+//   Question: can ONE data request return the SUM of many stocks' futures OI, using a symbol formula such as
+//   "NSE:TCS1!_OI+NSE:INFY1!_OI"? If yes, a whole sector costs one request and all ~200 F&O stocks fit in one script.
+//   How to use: add it to any NSE chart on 15 min. Read the table. Then change "Symbols in the big formula" to
+//   20, 40 and 80, one step at a time. If TradingView shows an error, copy its exact text.
+//   It uses about 19 data requests. Nothing here repaints a signal: it only compares numbers.
+// ═══════════════════════════════════════════════════════════════════════════
+
+bigN = input.int(10, "Symbols in the big formula", options=[10, 20, 40, 80], tooltip="10, 20 or 40 = near-month OI of that many stocks. 80 = near + next month OI of 40 stocks.")
+
+const string S10 = "NSE:RELIANCE1!_OI+NSE:TCS1!_OI+NSE:INFY1!_OI+NSE:HDFCBANK1!_OI+NSE:ICICIBANK1!_OI+NSE:SBIN1!_OI+NSE:AXISBANK1!_OI+NSE:KOTAKBANK1!_OI+NSE:LT1!_OI+NSE:ITC1!_OI"
+const string S20 = "NSE:RELIANCE1!_OI+NSE:TCS1!_OI+NSE:INFY1!_OI+NSE:HDFCBANK1!_OI+NSE:ICICIBANK1!_OI+NSE:SBIN1!_OI+NSE:AXISBANK1!_OI+NSE:KOTAKBANK1!_OI+NSE:LT1!_OI+NSE:ITC1!_OI+NSE:HINDUNILVR1!_OI+NSE:BHARTIARTL1!_OI+NSE:BAJFINANCE1!_OI+NSE:MARUTI1!_OI+NSE:ASIANPAINT1!_OI+NSE:TITAN1!_OI+NSE:SUNPHARMA1!_OI+NSE:WIPRO1!_OI+NSE:HCLTECH1!_OI+NSE:TECHM1!_OI"
+const string S40 = "NSE:RELIANCE1!_OI+NSE:TCS1!_OI+NSE:INFY1!_OI+NSE:HDFCBANK1!_OI+NSE:ICICIBANK1!_OI+NSE:SBIN1!_OI+NSE:AXISBANK1!_OI+NSE:KOTAKBANK1!_OI+NSE:LT1!_OI+NSE:ITC1!_OI+NSE:HINDUNILVR1!_OI+NSE:BHARTIARTL1!_OI+NSE:BAJFINANCE1!_OI+NSE:MARUTI1!_OI+NSE:ASIANPAINT1!_OI+NSE:TITAN1!_OI+NSE:SUNPHARMA1!_OI+NSE:WIPRO1!_OI+NSE:HCLTECH1!_OI+NSE:TECHM1!_OI+NSE:ULTRACEMCO1!_OI+NSE:NESTLEIND1!_OI+NSE:POWERGRID1!_OI+NSE:NTPC1!_OI+NSE:ONGC1!_OI+NSE:COALINDIA1!_OI+NSE:TATASTEEL1!_OI+NSE:JSWSTEEL1!_OI+NSE:HINDALCO1!_OI+NSE:GRASIM1!_OI+NSE:ADANIENT1!_OI+NSE:ADANIPORTS1!_OI+NSE:BPCL1!_OI+NSE:DRREDDY1!_OI+NSE:CIPLA1!_OI+NSE:EICHERMOT1!_OI+NSE:HEROMOTOCO1!_OI+NSE:DLF1!_OI+NSE:SIEMENS1!_OI+NSE:HAVELLS1!_OI"
+const string S80 = "NSE:RELIANCE1!_OI+NSE:TCS1!_OI+NSE:INFY1!_OI+NSE:HDFCBANK1!_OI+NSE:ICICIBANK1!_OI+NSE:SBIN1!_OI+NSE:AXISBANK1!_OI+NSE:KOTAKBANK1!_OI+NSE:LT1!_OI+NSE:ITC1!_OI+NSE:HINDUNILVR1!_OI+NSE:BHARTIARTL1!_OI+NSE:BAJFINANCE1!_OI+NSE:MARUTI1!_OI+NSE:ASIANPAINT1!_OI+NSE:TITAN1!_OI+NSE:SUNPHARMA1!_OI+NSE:WIPRO1!_OI+NSE:HCLTECH1!_OI+NSE:TECHM1!_OI+NSE:ULTRACEMCO1!_OI+NSE:NESTLEIND1!_OI+NSE:POWERGRID1!_OI+NSE:NTPC1!_OI+NSE:ONGC1!_OI+NSE:COALINDIA1!_OI+NSE:TATASTEEL1!_OI+NSE:JSWSTEEL1!_OI+NSE:HINDALCO1!_OI+NSE:GRASIM1!_OI+NSE:ADANIENT1!_OI+NSE:ADANIPORTS1!_OI+NSE:BPCL1!_OI+NSE:DRREDDY1!_OI+NSE:CIPLA1!_OI+NSE:EICHERMOT1!_OI+NSE:HEROMOTOCO1!_OI+NSE:DLF1!_OI+NSE:SIEMENS1!_OI+NSE:HAVELLS1!_OI+NSE:RELIANCE2!_OI+NSE:TCS2!_OI+NSE:INFY2!_OI+NSE:HDFCBANK2!_OI+NSE:ICICIBANK2!_OI+NSE:SBIN2!_OI+NSE:AXISBANK2!_OI+NSE:KOTAKBANK2!_OI+NSE:LT2!_OI+NSE:ITC2!_OI+NSE:HINDUNILVR2!_OI+NSE:BHARTIARTL2!_OI+NSE:BAJFINANCE2!_OI+NSE:MARUTI2!_OI+NSE:ASIANPAINT2!_OI+NSE:TITAN2!_OI+NSE:SUNPHARMA2!_OI+NSE:WIPRO2!_OI+NSE:HCLTECH2!_OI+NSE:TECHM2!_OI+NSE:ULTRACEMCO2!_OI+NSE:NESTLEIND2!_OI+NSE:POWERGRID2!_OI+NSE:NTPC2!_OI+NSE:ONGC2!_OI+NSE:COALINDIA2!_OI+NSE:TATASTEEL2!_OI+NSE:JSWSTEEL2!_OI+NSE:HINDALCO2!_OI+NSE:GRASIM2!_OI+NSE:ADANIENT2!_OI+NSE:ADANIPORTS2!_OI+NSE:BPCL2!_OI+NSE:DRREDDY2!_OI+NSE:CIPLA2!_OI+NSE:EICHERMOT2!_OI+NSE:HEROMOTOCO2!_OI+NSE:DLF2!_OI+NSE:SIEMENS2!_OI+NSE:HAVELLS2!_OI"
+string BIG = bigN == 10 ? S10 : bigN == 20 ? S20 : bigN == 40 ? S40 : S80
+
+f_c(string s) => request.security(s, timeframe.period, close, ignore_invalid_symbol=true)
+
+// ── Test 1: the same 10 stocks, one by one (10 requests) and as one formula (1 request) ──
+o1  = f_c("NSE:RELIANCE1!_OI")
+o2  = f_c("NSE:TCS1!_OI")
+o3  = f_c("NSE:INFY1!_OI")
+o4  = f_c("NSE:HDFCBANK1!_OI")
+o5  = f_c("NSE:ICICIBANK1!_OI")
+o6  = f_c("NSE:SBIN1!_OI")
+o7  = f_c("NSE:AXISBANK1!_OI")
+o8  = f_c("NSE:KOTAKBANK1!_OI")
+o9  = f_c("NSE:LT1!_OI")
+o10 = f_c("NSE:ITC1!_OI")
+sum10 = o1 + o2 + o3 + o4 + o5 + o6 + o7 + o8 + o9 + o10
+f10   = f_c(S10)
+
+// ── Test 2: weights inside a formula (2 × TCS + INFY) ──
+fW = f_c("NSE:TCS1!_OI*2+NSE:INFY1!_OI")
+
+// ── Test 3: the big formula (the size limit) ──
+fBig = f_c(BIG)
+
+// ── Test 4: price and volume of a formula ──
+[tC, tV] = request.security("NSE:TCS", timeframe.period, [close, volume], ignore_invalid_symbol=true)
+[iC, iV] = request.security("NSE:INFY", timeframe.period, [close, volume], ignore_invalid_symbol=true)
+fP = f_c("NSE:TCS/4000+NSE:INFY/1500")
+fV = request.security("NSE:TCS+NSE:INFY", timeframe.period, volume, ignore_invalid_symbol=true)
+
+// ── History statistics: how often the formula disagrees with the one-by-one sum, or is missing ──
+f_pct(float a, float b) => na(a) or na(b) or b == 0 ? na : math.abs(a - b) / math.abs(b) * 100
+var int   nBoth   = 0
+var int   nNaF    = 0
+var int   nOff    = 0
+var float maxOff  = 0.0
+var int   nBigNa  = 0
+var int   nBars   = 0
+nBars += 1
+if not na(sum10)
+    if na(f10)
+        nNaF += 1
+    else
+        nBoth += 1
+        d = f_pct(f10, sum10)
+        if not na(d)
+            maxOff := math.max(maxOff, d)
+            if d > 0.01
+                nOff += 1
+if na(fBig)
+    nBigNa += 1
+
+f_s(float x) => na(x) ? "na" : str.tostring(x, "#,##0.####")
+var table T = table.new(position.top_left, 3, 12, bgcolor=color.new(color.black, 0), border_color=color.gray, border_width=1, frame_color=color.gray, frame_width=1)
+f_row(int r, string a, string b, string c) =>
+    table.cell(T, 0, r, a, text_color=color.white, text_halign=text.align_left, text_size=size.small)
+    table.cell(T, 1, r, b, text_color=color.yellow, text_halign=text.align_right, text_size=size.small)
+    table.cell(T, 2, r, c, text_color=color.silver, text_halign=text.align_left, text_size=size.small)
+
+if barstate.islast
+    f_row(0,  "Test", "Value", "What it tells me")
+    f_row(1,  "1. 10 stocks one by one (sum)", f_s(sum10), "near-month OI, added up in Pine")
+    f_row(2,  "1. Same 10 as ONE formula", f_s(f10), "should equal the line above")
+    f_row(3,  "1. Bars compared / formula na / off >0.01%", str.tostring(nBoth) + " / " + str.tostring(nNaF) + " / " + str.tostring(nOff), "how the formula handles missing candles")
+    f_row(4,  "1. Worst difference %", f_s(maxOff), "0 = formula is exact")
+    f_row(5,  "2. Formula 2×TCS + INFY", f_s(fW), "check: " + f_s(o2 * 2 + o3))
+    f_row(6,  "3. Big formula, " + str.tostring(bigN) + " symbols", f_s(fBig), "na on " + str.tostring(nBigNa) + " of " + str.tostring(nBars) + " bars")
+    f_row(7,  "4. Price formula TCS/4000 + INFY/1500", f_s(fP), "check: " + f_s(tC / 4000 + iC / 1500))
+    f_row(8,  "4. Volume of formula TCS + INFY", f_s(fV), "check: " + f_s(tV + iV))
+    f_row(9,  "5. TCS near-month OI (raw)", f_s(o2), "compare with NSE's OI: shares or contracts?")
+    f_row(10, "Chart timeframe / bars loaded", timeframe.period + " / " + str.tostring(nBars), "")
+
+plot(f10, "Formula OI (10)", color.orange)
+plot(sum10, "Sum OI (10)", color.aqua)
