@@ -23,9 +23,20 @@ for k, s in secs.items():
 for k, s in secs.items():
     out.append(f'const string PX_{k:02d} = "' + "+".join(f"NSE:{t}/{g(p)}" for t, p in s["m"]) + '"')
 ks = list(secs.keys())
+# Every stock mapped to its sector, one line each (hard-coded: no TradingView lookup)
 out.append("f_secOf(string tk) =>")
-out.append("    string w = \",\" + tk + \",\"")
-out.append("    " + " : ".join(f"str.contains(M_{k:02d}, w) ? {k}" for k in ks) + " : 0")
+out.append("    switch tk")
+for k, sx in secs.items():
+    for t, _ in sx["m"]:
+        out.append(f'        "{t}" => {k}')
+out.append("        => 0")
+# The sector dropdown: its options (paste into the input) and its option -> code mapping
+out.append("// Dropdown options: " + ", ".join(['"All sectors"'] + [f'"{k} {sx["name"]}"' for k, sx in secs.items()]))
+out.append("f_selOf(string o) =>")
+out.append("    switch o")
+for k, sx in secs.items():
+    out.append(f'        "{k} {sx["name"]}" => {k}')
+out.append("        => 0")
 out.append("f_oiF(int s) =>")
 out.append("    " + " : ".join(f"s == {k} ? OI_{k:02d}" for k in ks) + " : NOSYM")
 out.append("f_pxF(int s) =>")
