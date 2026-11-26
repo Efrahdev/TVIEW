@@ -1,0 +1,317 @@
+//@version=6
+indicator("First Candle OI Screener 1.06", "FCOI Screener", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIRST CANDLE OI SCREENER 1.06 — a pure screening indicator for TradingView's Pine Screener
+//   Run it on a watchlist of F&O stocks' CASH symbols (for example NSE:RELIANCE), on ANY intraday timeframe.
+//   It reads ONE candle of the regular day (09:15–15:30):
+//     · by default the LATEST CLOSED candle (run on 15 min at 10:31 and it reads 10:15–10:30), or
+//     · the candle you pick in "Candle": the candle of the latest day that contains that time
+//       (on 15 min, 09:30 and 09:40 both pick 09:30–09:45). It fills once that candle has closed.
+//   A candle that is still forming is never used.
+//
+//   SCREENER COLUMNS (the 10 plots, in this order)
+//     1 PD OI added %        the previous day's near + next futures OI change: its last OI print against the day
+//                            before's last print (F&O trading after 15:30 included), % of the earlier OI. On a
+//                            contract-roll day (1! and 2! switch contracts), the one contract both days share.
+//     2 PD open to close %   the previous day's cash open to cash close, %.
+//     3 3-day close to close % the previous day's cash close against the close three trading days before it
+//                            (on 26 Nov: 20 Nov close to 25 Nov close, covering 23, 24 and 25 Nov).
+//     4 Rel volume %         the candle's cash volume ÷ the average cash volume of the candles that started at the
+//                            same time of day on up to the last 20 earlier days (at least 5). 100 = normal.
+//     5 Today's change %     today's cash open (09:15) to the candle's close, %.
+//     6 ΔOI % of avg         the candle's ΔOI ÷ the average ΔOI (152 = 1.52 times).
+//     7 OV % of avg          the candle's OV ratio ÷ the average OV ratio.
+//     8 Child %              the biggest child candle's cash volume ÷ the candle's cash volume.
+//     9 ΔOI                  the candle's ΔOI: near-month (1!) + next-month (2!) futures OI change over the candle.
+//    10 Avg ΔOI              the average ΔOI of the candles that added OI (the yardstick of column 6).
+//
+//   RULES
+//     ΔOI and OV ratio (100 × ΔOI ÷ near + next futures volume) cover exactly the candle's window: both contracts'
+//     OI and volume candles must start with the cash candle, and each previous OI print must be the cash chart's
+//     previous candle or later, on the same date. A missing or misaligned value is left empty, never guessed.
+//     An OV ratio above 100% is impossible inside one window, so it is treated as misaligned. On a roll morning the
+//     day's first candle uses the contract both days share.
+//     Averages = every candle (any time of day, green or red) that ADDED OI in the last N candles, leaving out the
+//     candle being scanned and roll-morning candles.
+//     Child % counts only when the child candles add up exactly to the candle's volume.
+//
+//   No repainting: a candle is read only after it has closed, every request uses lookahead_off, and nothing comes
+//   from a later candle. Pine Screener limits respected: 5 data requests, no timeframe, symbol or time inputs, and
+//   only the last 500 candles of history (see the Window setting).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────── INPUTS ─────────────────────────────────
+slotIn = input.string("Latest closed candle", "Candle", options=["Latest closed candle", "09:15", "09:20", "09:25", "09:30", "09:35", "09:40", "09:45", "09:50", "09:55", "10:00", "10:05", "10:10", "10:15", "10:20", "10:25", "10:30", "10:35", "10:40", "10:45", "10:50", "10:55", "11:00", "11:05", "11:10", "11:15", "11:20", "11:25", "11:30", "11:35", "11:40", "11:45", "11:50", "11:55", "12:00", "12:05", "12:10", "12:15", "12:20", "12:25", "12:30", "12:35", "12:40", "12:45", "12:50", "12:55", "13:00", "13:05", "13:10", "13:15", "13:20", "13:25", "13:30", "13:35", "13:40", "13:45", "13:50", "13:55", "14:00", "14:05", "14:10", "14:15", "14:20", "14:25", "14:30", "14:35", "14:40", "14:45", "14:50", "14:55", "15:00", "15:05", "15:10", "15:15", "15:20", "15:25"], display=display.none, tooltip="Latest closed candle: the newest candle that has closed.\nA time: the candle of the latest day that contains that time, for example 09:15 for the first candle. On 15 min, 09:30 and 09:40 both pick 09:30–09:45. It fills once that candle has closed.")
+pdOn   = input.bool(true, "Previous-day columns (1 to 3)", display=display.none, tooltip="PD OI added %, PD open to close % and 3-day close to close %. Unticked, those three columns stay empty.")
+chTf   = input.string("1 minute", "Child candle size", options=["1 second", "5 seconds", "10 seconds", "15 seconds", "30 seconds", "1 minute"], display=display.none, tooltip="The small candles inside the candle. Child % = the biggest one's share of the candle's cash volume. Seconds need a Premium plan or higher, and the child must be shorter than the chart's candle (on a 1 min chart pick seconds).")
+avgN   = input.int(498, "Window: the last N candles", minval=10, maxval=5000, display=display.none, tooltip="The ΔOI and OV averages and the relative volume all come from this window. The Pine Screener holds only 500 candles, and 498 makes a chart and the screener use exactly the same candles. On 15 min that is about 19 days, on 5 min about 6.")
+rvDays = input.int(20, "Relative volume: same time of day on the last N days", minval=1, maxval=60, display=display.none, tooltip="Normal volume = the average cash volume of the candles that started at the same time of day on up to this many earlier days inside the window.")
+rvMin  = input.int(5, "Relative volume: fewest days needed", minval=1, maxval=60, display=display.none, tooltip="With fewer earlier days than this inside the window, Rel volume % stays empty (in the screener: 1 min charts, where 500 candles hold about 1 day).")
+
+// ─────────────────────────── CHART CHECK AND CONSTANTS ───────────────────────────
+if not timeframe.isminutes
+    runtime.error("FCOI Screener: use an intraday timeframe from 1 minute to 4 hours.")
+
+const string NOSYM  = "NSE:FCOI_NO_SYMBOL_0"       // deliberately invalid: a request that is not needed loads nothing
+const int    PD_MAX = 400                          // previous-day rows kept (far more than any window holds)
+int    TF_MS   = timeframe.in_seconds() * 1000
+int    CH_SEC  = chTf == "1 second" ? 1 : chTf == "5 seconds" ? 5 : chTf == "10 seconds" ? 10 : chTf == "15 seconds" ? 15 : chTf == "30 seconds" ? 30 : 60
+string CH_TF   = CH_SEC < 60 ? str.tostring(CH_SEC) + "S" : "1"
+bool   CH_OK   = CH_SEC * 1000 < TF_MS             // a child must be shorter than the chart candle
+int    CH_BARS = math.round(48000.0 / CH_SEC)      // child candles in two sessions of 400 minutes: covers the latest session
+bool   SLOT_ON = slotIn != "Latest closed candle"
+int    SLOT_H  = SLOT_ON ? math.round(str.tonumber(str.substring(slotIn, 0, 2))) : 9
+int    SLOT_M  = SLOT_ON ? math.round(str.tonumber(str.substring(slotIn, 3, 5))) : 15
+
+// ─────────────────────────────── UTILITIES ───────────────────────────────
+f_at(int t, int h, int m) => timestamp(syminfo.timezone, year(t), month(t), dayofmonth(t), h, m, 0)
+f_ymd(int t) => year(t) * 10000 + month(t) * 100 + dayofmonth(t)
+// A futures value's previous candle belongs to the cash chart's previous candle: same date, and not earlier
+f_prevOk(int prevT, float prevV, int pt) => not na(pt) and not na(prevT) and prevT >= pt and f_ymd(prevT) == f_ymd(pt) and not na(prevV)
+
+// ─────────────────────────────── DATA REQUESTS (5) ───────────────────────────────
+// Futures: near month (1!) and next month (2!) of the same stock, the chart's timeframe, gaps_on (no futures candle
+// at this time = na, never a carried value), lookahead_off. Each request returns its own candle's time, so the
+// alignment with the cash candle is checked, not assumed. Each OI series also keeps its own previous day's LAST
+// print, worked out inside the futures series itself.
+string EXCH = syminfo.prefix == "BSE" ? "NSE" : syminfo.prefix
+string FUT1 = EXCH + ":" + syminfo.ticker + "1!"
+string FUT2 = EXCH + ":" + syminfo.ticker + "2!"
+f_oiReq() =>                                       // this OI candle, the one before it, and the previous day's last OI
+    var float eod  = na
+    var int   eodT = na
+    if not na(time[1]) and f_ymd(time) != f_ymd(time[1])
+        eod  := close[1]
+        eodT := time[1]
+    [time, close, time[1], close[1], eod, eodT]
+f_vReq() => [time, volume]
+[n1T, n1C, n1PT, n1PC, n1E, n1ET] = request.security(FUT1 + "_OI", timeframe.period, f_oiReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[n2T, n2C, n2PT, n2PC, n2E, n2ET] = request.security(FUT2 + "_OI", timeframe.period, f_oiReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[v1T, v1V] = request.security(FUT1, timeframe.period, f_vReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[v2T, v2V] = request.security(FUT2, timeframe.period, f_vReq(), gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+// Child candles: the stock's own cash volume, one value per child candle inside this chart candle (with its start time)
+[cT, cV] = request.security_lower_tf(CH_OK ? syminfo.tickerid : NOSYM, CH_TF, [time, volume], ignore_invalid_symbol=true, ignore_invalid_timeframe=true, calc_bars_count=CH_BARS)
+
+// ─────────────────────────────── CANDLE AND DAY ───────────────────────────────
+// A candle counts only once it has closed. The time test also guards the screener's last candle while it is forming.
+bool closed = barstate.isconfirmed and (barstate.isrealtime or na(timenow) or time_close <= timenow)
+int  bD0    = f_at(time, 9, 15)
+bool inDay  = time >= bD0 and time < f_at(time, 16, 0)     // the regular day (no evening special sessions)
+bool cBar   = closed and inDay                              // a closed candle of the regular day
+int  pT     = time[1]                                       // the cash chart's previous candle
+var int dayKey = na
+bool newDay = cBar and (na(dayKey) or bD0 != dayKey)        // the day's first closed candle
+
+// ─────────────────────────────── THIS CANDLE'S FUTURES ───────────────────────────────
+bool o1 = not na(n1T) and n1T == time and n1C > 0 and f_prevOk(n1PT, n1PC, pT) and n1PC > 0
+bool o2 = not na(n2T) and n2T == time and n2C > 0 and f_prevOk(n2PT, n2PC, pT) and n2PC > 0
+bool q1 = not na(v1T) and v1T == time and not na(v1V)
+bool q2 = not na(v2T) and v2T == time and not na(v2V)
+// Contract roll (only overnight): today's near month looks like yesterday's next month
+bool roll = newDay and o1 and o2 and math.abs(n1C - n2PC) < math.abs(n1C - n1PC)
+float cD  = na
+float cO  = na
+int   cCd = 1                                      // 0 valid · 2 valid, roll morning: the shared contract only · 1 missing or misaligned · 3 OV above 100%
+if roll
+    if q1 and v1V > 0
+        float d = n1C - n2PC                       // today's near month = yesterday's next month: the same contract
+        float o = 100.0 * d / v1V
+        if math.abs(o) > 100.0
+            cCd := 3
+        else
+            cCd := 2
+            cD  := d
+            cO  := o
+else if o1 and o2 and q1 and q2 and v1V + v2V > 0
+    float d = (n1C - n1PC) + (n2C - n2PC)
+    float o = 100.0 * d / (v1V + v2V)
+    if math.abs(o) > 100.0
+        cCd := 3
+    else
+        cCd := 0
+        cD  := d
+        cO  := o
+
+// ─────────────────────────────── STATE ───────────────────────────────
+// Rolling window of the last N closed candles of the regular day
+var array<float> hOI  = array.new_float()  // ΔOI of the candles that added OI (na = not added, roll morning or no data)
+var array<float> hOV  = array.new_float()  // their OV ratio, same rows
+var array<float> hVol = array.new_float()  // cash volume
+var array<int>   hMin = array.new_int()    // start time, minutes after midnight
+var array<int>   hYmd = array.new_int()    // date
+var float sOI = 0.0                        // running sums and count of the hOI rows that are not na
+var float sOV = 0.0
+var int   cOI = 0
+var int   nC  = 0                          // closed candles of the regular day so far
+// The candle being scanned
+var int   tT    = na
+var int   tC    = na                       // its nC
+var float tD    = na
+var float tO    = na
+var int   tCd   = 1
+var float tCl   = na                       // its close
+var float tVol  = na                       // its cash volume
+var float tDOp  = na                       // its day's 09:15 open (na if that day did not start at 09:15)
+var float chSh  = na                       // child share, %
+// The day in progress
+var int   dStBi  = na                      // its first closed candle's bar_index
+var bool  dPrev  = false                   // the day before it was seen (so this day is not a partial first day)
+var float dOpen  = na
+var bool  dSt915 = false
+var float dClose = na
+var int   dLastT = na                      // its latest closed candle's open time
+var int   pvYmd  = na                      // the date of the day before it
+// Its start = the day before's last OI prints, captured on its first candle that has futures data
+var bool  stOI  = false
+var float sP1   = na
+var float sP2   = na
+var bool  sRoll = false                    // 1! and 2! switched contracts between the day before and this day
+// The previous day's start, waiting for its end (the last prints, seen on today's candles)
+var bool  wPend = false
+var bool  wOk   = false
+var float wP1   = na
+var float wP2   = na
+var bool  wRoll = false
+// One row per finished day, oldest first
+var array<float> pdOI = array.new_float()  // OI added, %
+var array<float> pdOC = array.new_float()  // cash open to close, %
+var array<float> pdCl = array.new_float()  // cash close
+
+// ─────────────────────────────── A NEW DAY: finish the previous one ───────────────────────────────
+if newDay
+    if not na(dStBi)
+        pdOI.push(na)                      // filled in below, once today's futures data shows that day's last prints
+        pdOC.push(dPrev and dOpen > 0 ? 100.0 * (dClose - dOpen) / dOpen : na)
+        pdCl.push(dClose)
+        if pdCl.size() > PD_MAX
+            pdOI.shift()
+            pdOC.shift()
+            pdCl.shift()
+        wPend := true
+        wOk   := stOI
+        wP1   := sP1
+        wP2   := sP2
+        wRoll := sRoll
+    // Start the new day
+    dPrev  := not na(dLastT)
+    pvYmd  := na(dLastT) ? na : f_ymd(dLastT)
+    dayKey := bD0
+    dStBi  := bar_index
+    dOpen  := open
+    dSt915 := time == bD0
+    stOI   := false
+    sP1    := na
+    sP2    := na
+    sRoll  := false
+    if SLOT_ON
+        tT := na                           // the picked slot of a new day has not closed yet
+        tC := na
+
+// ─────────── EVERY CLOSED CANDLE: the previous day's last OI prints, from today's futures candles ───────────
+if cBar and not na(pvYmd) and not stOI
+    // Both series have a candle with this cash candle, and their recorded last prints are from the day before
+    if not na(n1T) and n1T == time and not na(n2T) and n2T == time and not na(n1ET) and not na(n2ET) and f_ymd(n1ET) == pvYmd and f_ymd(n2ET) == pvYmd and n1E > 0 and n2E > 0 and n1C > 0
+        stOI  := true
+        sP1   := n1E
+        sP2   := n2E
+        sRoll := math.abs(n1C - n2E) < math.abs(n1C - n1E)
+        if wPend
+            wPend := false
+            if wOk
+                // the previous day's ΔOI: near + next, or on a roll day the one contract both its ends share
+                float dd   = wRoll ? n1E - wP2 : (n1E + n2E) - (wP1 + wP2)
+                float base = wRoll ? wP2 : wP1 + wP2
+                pdOI.set(pdOI.size() - 1, 100.0 * dd / base)
+
+// ─────────────────────────────── EVERY CLOSED CANDLE ───────────────────────────────
+if cBar
+    nC     += 1
+    dClose := close
+    dLastT := time
+    // Into the rolling window (a roll-morning candle stays out of the averages)
+    float rD = cCd == 0 and cD > 0 ? cD : na
+    float rO = cCd == 0 and cD > 0 ? cO : na
+    hOI.push(rD)
+    hOV.push(rO)
+    hVol.push(volume)
+    hMin.push(hour(time) * 60 + minute(time))
+    hYmd.push(f_ymd(time))
+    if not na(rD)
+        sOI += rD
+        sOV += rO
+        cOI += 1
+    while hOI.size() > avgN
+        float xD = hOI.shift()
+        float xO = hOV.shift()
+        hVol.shift()
+        hMin.shift()
+        hYmd.shift()
+        if not na(xD)
+            sOI -= xD
+            sOV -= xO
+            cOI -= 1
+    // The candle being scanned: the latest closed one, or the one that contains the picked time
+    int  slotT  = f_at(time, SLOT_H, SLOT_M)
+    bool isSlot = SLOT_ON and time <= slotT and slotT < time + TF_MS
+    if not SLOT_ON or isSlot
+        tT   := time
+        tC   := nC
+        tD   := cD
+        tO   := cO
+        tCd  := cCd
+        tCl  := close
+        tVol := volume
+        tDOp := dSt915 and dOpen > 0 ? dOpen : na
+        // Child contribution: exact only, so the child candles must add up to the candle's own volume.
+        // Child data covers about the last two days, so it is worked out only where it can be shown.
+        chSh := na
+        if CH_OK and (SLOT_ON or bar_index >= last_bar_index - 1) and not na(cV) and cV.size() > 0 and volume > 0
+            float s = 0.0
+            float b = 0.0
+            for v in cV
+                float x = nz(v)
+                s += x
+                b := math.max(b, x)
+            if math.abs(s - volume) < 0.5
+                chSh := 100.0 * b / volume
+
+// ─────────────────────────────── AVERAGES ───────────────────────────────
+// ΔOI and OV: every candle that added OI in the window, leaving out the candle being scanned
+bool  show  = not na(tT)
+bool  tIn   = show and tCd == 0 and tD > 0 and nC - tC < hOI.size()
+int   refN  = cOI - (tIn ? 1 : 0)
+float refOI = refN > 0 ? (sOI - (tIn ? tD : 0.0)) / refN : na
+float refOV = refN > 0 ? (sOV - (tIn ? tO : 0.0)) / refN : na
+// Relative volume: the candles that started at the same time of day on earlier days inside the window, newest first
+float tRv = na
+if barstate.islast and show and tVol > 0
+    int   tMin = hour(tT) * 60 + minute(tT)
+    int   tYmd = f_ymd(tT)
+    float s    = 0.0
+    int   c    = 0
+    int   i    = hVol.size() - 1
+    while i >= 0 and c < rvDays
+        if hMin.get(i) == tMin and hYmd.get(i) < tYmd
+            s += hVol.get(i)
+            c += 1
+        i -= 1
+    tRv := c >= rvMin and s > 0 ? 100.0 * tVol / (s / c) : na
+// The previous day = the newest finished day; three days = it and the two before it
+int   pdN  = pdCl.size()
+float pOI  = pdOn and pdN > 0 ? pdOI.last() : na
+float pOC  = pdOn and pdN > 0 ? pdOC.last() : na
+float p3   = pdOn and pdN >= 4 and pdCl.get(pdN - 4) > 0 ? 100.0 * (pdCl.last() - pdCl.get(pdN - 4)) / pdCl.get(pdN - 4) : na
+
+// ─────────────────────────────── SCREENER COLUMNS (the 10 plots) ───────────────────────────────
+// Not drawn on the chart: the values appear in the Pine Screener (and in a chart's data window).
+plot(pOI, "PD OI added %", #9C27B0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(pOC, "PD open to close %", #9C27B0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(p3, "3-day close to close %", #9C27B0, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(tRv, "Rel volume %", #2962FF, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(show and not na(tDOp) ? 100.0 * (tCl - tDOp) / tDOp : na, "Today's change %", #2962FF, display=display.all - display.pane - display.price_scale - display.status_line, precision=2)
+plot(show and not na(tD) and refOI > 0 ? 100.0 * tD / refOI : na, "ΔOI % of avg", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(show and not na(tO) and refOV > 0 ? 100.0 * tO / refOV : na, "OV % of avg", #26A69A, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(show ? chSh : na, "Child %", #00ACC1, display=display.all - display.pane - display.price_scale - display.status_line, precision=1)
+plot(show ? tD : na, "ΔOI", #787B86, display=display.all - display.pane - display.price_scale - display.status_line, format=format.volume)
+plot(refOI, "Avg ΔOI", #787B86, display=display.all - display.pane - display.price_scale - display.status_line, format=format.volume)
